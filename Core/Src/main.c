@@ -40,7 +40,10 @@ typedef enum
   ASR_VERDICT_PASS          = 0x00U,  /* bus alive, module quiet (reads 0x00) */
   ASR_VERDICT_NO_DEVICE     = 0x01U,  /* bus clocks, but nobody ACKs        */
   ASR_VERDICT_DEVICE_SILENT = 0x02U,  /* ACKs, but never returns a valid code */
-  ASR_VERDICT_BUS_STUCK     = 0x03U   /* a line held low / no pull-ups      */
+  ASR_VERDICT_BUS_STUCK     = 0x03U,  /* a line held low                    */
+  ASR_VERDICT_NO_PULLUP     = 0x04U   /* no external pull-up fitted -- the
+                                       * bus only looks high because of the
+                                       * MCU's own weak internal pull-up      */
 } ASR_Verdict_t;
 
 /* USER CODE END PTD */
@@ -145,7 +148,8 @@ volatile uint8_t  asr_selftest_stage    = 0U;
 volatile uint8_t  asr_selftest_verdict  = ASR_VERDICT_PENDING;
 volatile uint32_t asr_selftest_read_attempts = 0U;
 volatile uint32_t asr_selftest_read_ok  = 0U;
-volatile uint8_t  asr_selftest_bus_low  = 0U;  /* 1 = a line idle low       */
+volatile uint8_t  asr_selftest_bus_low  = 0U;  /* 1 = a line held low       */
+volatile uint8_t  asr_selftest_pullup_present = 0U;  /* 1 = external pull-up found */
 
 /* Per-candidate address probe results, indexed [0]=0x68, [1]=0x66.
  * probe_result: 0 = ACK, 0xFF = no ACK. */
@@ -165,6 +169,8 @@ static HAL_StatusTypeDef ASR_BusRecover(void);
 static HAL_StatusTypeDef ASR_ReadResult(uint16_t addr8, uint8_t *out);
 /* Probe candidates, latch whichever ACKs. Returns chosen address. */
 static uint16_t ASR_ProbeAddress(void);
+/* Sweep the 7-bit address space and report every address that ACKs. */
+static void ASR_BusScan(void);
 /* Bounded self-test with a verdict. Runs without any speech. */
 static void ASR_SelfTest(void);
 /* Push one sample into the raw trace ring. */
@@ -281,9 +287,19 @@ int main(void)
    * doubt -- the module may simply have been slower to boot than the MCU.
    * Re-probing after a PASS or a stuck bus would just add startup delay. */
   if ((asr_selftest_verdict != ASR_VERDICT_PASS) &&
-      (asr_selftest_verdict != ASR_VERDICT_BUS_STUCK))
+      (asr_selftest_verdict != ASR_VERDICT_BUS_STUCK) &&
+      (asr_selftest_verdict != ASR_VERDICT_NO_PULLUP))
   {
     ASR_ProbeAddress();
+
+    /* Neither documented address answered. Only a scan can distinguish
+     * "the module is somewhere undocumented" from "the module is not
+     * talking at all" -- and the bus must be healthy for the scan to mean
+     * anything, hence NO_PULLUP/BUS_STUCK were excluded above. */
+    if (asr_selftest_verdict == ASR_VERDICT_NO_DEVICE)
+    {
+      ASR_BusScan();
+    }
   }
 
   printf("Address in use: 0x%02X (7-bit 0x%02X)\r\n",
@@ -578,6 +594,49 @@ static uint16_t ASR_ProbeAddress(void)
 }
 
 /* --------------------------------------------------------------------------
+ * Sweep the 7-bit address space and print every address that ACKs.
+ *
+ * This is the tool for the situation the handoff cannot resolve: the module
+ * answers at neither 0x34 nor 0x33. Either it is at an address nobody
+ * documented, or it is not talking. A scan separates those two cases in one
+ * run instead of in an afternoon of guessing.
+ *
+ * Uses HAL_I2C_IsDeviceReady, which only emits a bare address byte and waits
+ * for the ADDR flag. That is all a scan needs -- it proves an address ACKs,
+ * without assuming anything about the register protocol behind it.
+ *
+ * Reserved addresses are skipped: 0x00-0x07 (general call / CBUS / high-speed
+ * / EEPROM) and 0x78-0x7F (10-bit addressing and reserved).
+ * ------------------------------------------------------------------------ */
+static void ASR_BusScan(void)
+{
+  uint8_t addr7;
+  uint8_t found = 0U;
+
+  printf("Bus scan (7-bit 0x08-0x77)...\r\n");
+
+  for (addr7 = 0x08U; addr7 <= 0x77U; addr7++)
+  {
+    if (HAL_I2C_IsDeviceReady(&hi2c1,
+                              (uint16_t)(addr7 << 1),
+                              2U,          /* 2 trials per address */
+                              20U) == HAL_OK)
+    {
+      printf("  found device at 7-bit 0x%02X (HAL 0x%02X)\r\n",
+             (unsigned)addr7, (unsigned)(addr7 << 1));
+      found = 1U;
+    }
+  }
+
+  if (found == 0U)
+  {
+    printf("  no device ACKed anywhere on the bus.\r\n");
+    printf("  Bus reads high but nothing answers: check module power and\r\n");
+    printf("  that SDA/SCL are wired and not swapped.\r\n");
+  }
+}
+
+/* --------------------------------------------------------------------------
  * Push one raw sample into the ring buffer. Deliberately unconditional:
  * this is the evidence that reveals the module's result hold time.
  * ------------------------------------------------------------------------ */
@@ -653,21 +712,85 @@ static void ASR_SelfTest(void)
 
   asr_selftest_verdict = ASR_VERDICT_PENDING;
 
-  /* ---- Stage 1: is the bus actually idling high? -----------------------
-   * With the peripheral disabled and both pins as pulled-up inputs, a 0
-   * read means something is holding the line down hard. The F1's internal
-   * pull-up is only ~30-50k, so a 0 here is a genuine low, not weakness.
+  /* ---- Stage 1: is there a real external pull-up? ----------------------
+   * The naive test -- configure the pins as pulled-up inputs and read --
+   * is useless, because the STM32F1's HAL programs a GPIO_PULLUP for INPUT
+   * mode by setting the ODR bit (stm32f1xx_hal_gpio.c, the GPIO_PULLUP
+   * branch). That internal pull-up (~30-50k) holds the line high even on a
+   * bare board with nothing attached, so the test passes when it should
+   * fail. It measures the MCU's own pull-up, not the board's.
    *
-   * Limitation worth stating: if external 4.7k pull-ups are ALSO fitted,
-   * they sit in parallel and this still reads 1. So this stage cannot
-   * prove the external pull-ups exist -- only that nothing is shorting the
-   * bus. Confirming the pull-ups needs the meter (Step 1.3). */
+   * Instead, use the resolution difference between a real pull-up and a
+   * floating pin:
+   *
+   *   1. Drive the line LOW through an open-drain output. This discharges
+   *      the bus capacitance. Open-drain means we can only pull down; the
+   *      high level must come from a pull-up resistor, whoever provides it.
+   *   2. Release it (switch to a plain input, NO internal pull-up) and wait.
+   *      A real external pull-up (~5k) recharges the line in well under
+   *      50 us: tau = 5k * ~200pF = 1 us. With NO external pull-up the pin
+   *      is floating; the only current is leakage, so it stays low.
+   *   3. Re-read with the internal pull-up enabled. This separates
+   *      "no pull-up" (now reads high -- the MCU supplies it) from
+   *      "something is holding the bus down" (still reads low).
+   *
+   * Outcomes:
+   *   step 2 high                        -> external (or module) pull-up present
+   *   step 2 low, step 3 high            -> NO external pull-up: fits one
+   *   step 2 low, step 3 low             -> a device is holding the bus low
+   */
   asr_selftest_stage = 1U;
 
-  __HAL_I2C_DISABLE(&hi2c1);
+  /* DeInit rather than __HAL_I2C_DISABLE(): DeInit sets State to
+   * HAL_I2C_STATE_RESET, and HAL_I2C_Init() only re-runs HAL_I2C_MspInit()
+   * when State is RESET. Using the bare disable left State at READY, so the
+   * later MX_I2C1_Init() skipped MspInit entirely and PB6/PB7 stayed plain
+   * GPIO inputs instead of AF_OD -- the peripheral could not drive the bus
+   * at all. That produced HAL_I2C_WRONG_START (0x200) on every probe. */
+  HAL_I2C_DeInit(&hi2c1);
 
+  /* 1. Discharge: drive both lines low as open-drain outputs. */
+  gpio.Pin   = GPIO_PIN_6 | GPIO_PIN_7;
+  gpio.Mode  = GPIO_MODE_OUTPUT_OD;
+  gpio.Pull  = GPIO_NOPULL;
+  gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOB, &gpio);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6 | GPIO_PIN_7, GPIO_PIN_RESET);
+
+  ASR_ShortDelay(200U);   /* hold low long enough to fully discharge */
+
+  /* 2. Release into a floating input and see whether anything recharges. */
   gpio.Pin  = GPIO_PIN_6 | GPIO_PIN_7;
   gpio.Mode = GPIO_MODE_INPUT;
+  gpio.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &gpio);
+
+  ASR_ShortDelay(50U);
+
+  /* Require a majority of samples high, not merely one. A floating line can
+   * pick up noise and read high on a single sample; a real pull-up holds it
+   * high on every sample. Accepting any single high would let noise fake a
+   * pass, which is the failure mode this whole check exists to prevent. */
+  {
+    uint8_t high_count = 0U;
+
+    for (x = 0U; x < 8U; x++)
+    {
+      if ((HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_SET) &&
+          (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_SET))
+      {
+        high_count++;
+      }
+      ASR_ShortDelay(20U);
+    }
+
+    if (high_count >= 6U)   /* 6 of 8 */
+    {
+      asr_selftest_pullup_present = 1U;
+    }
+  }
+
+  /* 3. Now with the internal pull-up: only a genuinely held-low bus stays low. */
   gpio.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOB, &gpio);
 
@@ -685,10 +808,29 @@ static void ASR_SelfTest(void)
 
   MX_I2C1_Init();   /* restore AF_OD */
 
+  /* Report the raw evidence, so the conclusion is never guessed from prose. */
+  printf("Post-test 1: pull-up %s, bus %s\r\n",
+         (asr_selftest_pullup_present != 0U) ? "detected" : "NOT detected",
+         (asr_selftest_bus_low != 0U) ? "held LOW" : "idles high");
+
   if (asr_selftest_bus_low != 0U)
   {
-    /* We already know the answer and the reason; no point exercising I2C. */
+    /* Something is actively holding the line down. Stop here: the answer
+     * and the reason are both already known, and exercising I2C could not
+     * add anything. */
     asr_selftest_verdict = ASR_VERDICT_BUS_STUCK;
+    asr_selftest_stage = 4U;
+    return;
+  }
+
+  if (asr_selftest_pullup_present == 0U)
+  {
+    /* The bus idles high only thanks to the MCU's internal pull-up, which
+     * is far too weak to run I2C at 100 kHz. Any reads would NACK, which
+     * looks identical to an absent device -- so do not run them and do not
+     * report NO_DEVICE. That confusion is exactly what this check exists
+     * to prevent. */
+    asr_selftest_verdict = ASR_VERDICT_NO_PULLUP;
     asr_selftest_stage = 4U;
     return;
   }
@@ -708,14 +850,20 @@ static void ASR_SelfTest(void)
                                                 I2C_MEMADD_SIZE_8BIT,
                                                 &probe, 1U, ASR_PROBE_TIMEOUT_MS);
         asr_probe_status[i] = (uint32_t)st;
-        err_seen |= HAL_I2C_GetError(&hi2c1);
 
         if (st == HAL_OK)
         {
           asr_addr_probe_result[i] = 0U;
           asr_i2c_address = candidates[i];
+          /* Do NOT fold the error code in on success -- a stale code left
+           * over from an earlier failure would be misread as evidence about
+           * this probe. */
           break;
         }
+
+        /* Only a failed transaction contributes to the error evidence. */
+        asr_probe_error[i] = HAL_I2C_GetError(&hi2c1);
+        err_seen |= asr_probe_error[i];
 
         asr_addr_probe_result[i] = 0xFFU;
         HAL_Delay(ASR_SELFTEST_PROBE_GAP);
@@ -758,32 +906,69 @@ static void ASR_SelfTest(void)
 
   asr_selftest_stage = 4U;
 
+  /* ---- Raw evidence, printed before any interpretation ---------------
+   * The previous version of this code collapsed several distinct faults
+   * into one verdict and then described it in prose ("bus clocks, nobody
+   * ACKs") that was not actually verified. Print the measurements first so
+   * the conclusion can be checked rather than trusted.
+   *
+   * Error code reference (Keil's Watch window will not resolve these):
+   *   HAL_I2C_ERROR_AF      = 0x04 -> NACK: bytes clocked out, nobody answered
+   *   HAL_I2C_ERROR_TIMEOUT = 0x20 -> the bus never clocked at all
+   *   HAL_I2C_ERROR_BERR    = 0x01 -> misplaced start/stop
+   *   HAL_I2C_ERROR_ARLO    = 0x02 -> arbitration lost
+   * A code of 0x00 alongside a HAL_ERROR/HAL_BUSY status is its own case:
+   * the HAL returned without setting anything, which is the signature of
+   * the peripheral being latched rather than of a device-level NACK. */
+  /* Status legend matches HAL_StatusTypeDef (stm32f1xx_hal_def.h):
+   *   0 = HAL_OK, 1 = HAL_ERROR, 2 = HAL_BUSY, 3 = HAL_TIMEOUT
+   * Error code legend:
+   *   0x01 BERR, 0x02 ARLO, 0x04 AF (NACK), 0x08 OVR, 0x20 TIMEOUT,
+   *   0x200 WRONG_START (START never generated -- bus not being driven) */
+  printf("Probe 0x68: status=%u (0=OK 1=ERR 2=BUSY 3=TIMEOUT), err=0x%03lX\r\n",
+         (unsigned)asr_probe_status[0], (unsigned long)asr_probe_error[0]);
+  printf("Probe 0x66: status=%u (0=OK 1=ERR 2=BUSY 3=TIMEOUT), err=0x%03lX\r\n",
+         (unsigned)asr_probe_status[1], (unsigned long)asr_probe_error[1]);
+  printf("Self-test: %lu/%lu reads OK, errors seen 0x%02lX\r\n",
+         (unsigned long)asr_selftest_read_ok,
+         (unsigned long)ASR_SELFTEST_ATTEMPTS,
+         (unsigned long)err_seen);
+
   /* ---- Verdict --------------------------------------------------------
-   * AF (0x04) vs TIMEOUT (0x20) is the distinction that matters: a NACK
-   * proves the bus clocked bytes out successfully, whereas a timeout means
-   * it never clocked at all. Those have opposite remedies, so they must
-   * not be collapsed into one "failed" bucket. */
+   * Order matters: the bus-health conclusions must be reachable before the
+   * device-level ones, because a bus fault makes every device-level
+   * observation meaningless. */
   if ((ok >= ASR_SELFTEST_MIN_OK) && (nonzero_seen == 0U))
   {
     asr_selftest_verdict = ASR_VERDICT_PASS;
   }
   else if ((asr_addr_probe_result[0] == 0U) || (asr_addr_probe_result[1] == 0U))
   {
-    /* Address answered, so the bus works; the module is the problem. */
+    /* An address answered, so the bus demonstrably works and the module is
+     * the thing that needs attention. */
     asr_selftest_verdict = ASR_VERDICT_DEVICE_SILENT;
+  }
+  else if (err_seen == 0U)
+  {
+    /* Nothing ACKed AND the HAL never set an error code. Falling through to
+     * NO_DEVICE here would repeat the original mistake: claiming the bus
+     * clocked when there is no evidence that it did. Report a bus fault. */
+    asr_selftest_verdict = ASR_VERDICT_BUS_STUCK;
   }
   else if ((err_seen & HAL_I2C_ERROR_TIMEOUT) != 0U)
   {
+    /* The bus never clocked at all -- a held line or a clocking fault. */
     asr_selftest_verdict = ASR_VERDICT_BUS_STUCK;
   }
   else
   {
+    /* NACKs with no timeout: the bus clocked bytes out, so it is
+     * electrically sound, and nothing answered at either address. */
     asr_selftest_verdict = ASR_VERDICT_NO_DEVICE;
   }
 
   /* 0xFF is outside the valid code set, which means the slave was not
-   * driving SDA during the read phase -- a different fault from a NACK.
-   * Surfaced in the log so the two are not confused. */
+   * driving SDA during the read phase -- a different fault from a NACK. */
   if ((asr_selftest_verdict == ASR_VERDICT_DEVICE_SILENT) && (invalid_code_seen != 0U))
   {
     printf("  note: read values outside the valid set 0x00-0x09; slave is\r\n");
@@ -796,9 +981,10 @@ static const char *ASR_VerdictName(uint8_t verdict)
   switch (verdict)
   {
     case ASR_VERDICT_PASS:          return "PASS - bus alive, module quiet";
-    case ASR_VERDICT_NO_DEVICE:     return "NO_DEVICE - bus clocks, nobody ACKs";
+    case ASR_VERDICT_NO_DEVICE:     return "NO_DEVICE - bus clocked, nobody ACKed";
     case ASR_VERDICT_DEVICE_SILENT: return "DEVICE_SILENT - ACKs but no valid code";
-    case ASR_VERDICT_BUS_STUCK:     return "BUS_STUCK - line held low / no pull-ups";
+    case ASR_VERDICT_BUS_STUCK:     return "BUS_STUCK - line held low or no clock";
+    case ASR_VERDICT_NO_PULLUP:     return "NO_PULLUP - fit an external pull-up";
     default:                        return "PENDING";
   }
 }
@@ -828,9 +1014,15 @@ static void ASR_LedInit(void)
 
 static void ASR_LedService(void)
 {
-  static uint32_t next_tick = 0U;
-  static uint32_t last_seen_count = 0U;
-  static uint8_t  phase = 0U;
+  /* Clean state machine: one static for the next timer deadline, one for
+   * the LED phase (on/off), one for how many blinks remain in the current
+   * group, and one for the group's trailing gap. Non-blocking throughout --
+   * the caller runs this every loop iteration. */
+  static uint32_t next_tick    = 0U;
+  static uint32_t last_seen    = 0U;
+  static uint8_t  led_on       = 0U;
+  static uint8_t  blinks_left  = 0U;
+  static uint8_t  in_gap       = 0U;
   uint32_t now = HAL_GetTick();
 
   if (now < next_tick)
@@ -838,38 +1030,81 @@ static void ASR_LedService(void)
     return;
   }
 
-  /* Watch asr_command_count rather than consuming asr_new_command: that flag
-   * is a consume-once handshake reserved for the actuator layer, and the LED
-   * must not eat it. */
-  if (asr_command_count != last_seen_count)
+  /* A received command briefly overrides the verdict pattern, so there is
+   * instantaneous feedback while speaking. Watch asr_command_count rather
+   * than consuming asr_new_command -- that flag is a consume-once handshake
+   * reserved for the actuator layer, and the LED must not eat it. */
+  if (asr_command_count != last_seen)
   {
-    last_seen_count = asr_command_count;
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);   /* flash on */
-    next_tick = now + 30U;
+    last_seen = asr_command_count;
+    led_on = 1U;
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);   /* on, active low */
+    next_tick = now + 40U;
+    /* Reset the pattern so it restarts cleanly afterwards. */
+    blinks_left = 0U;
+    in_gap = 1U;
     return;
   }
 
-  if ((asr_device_online == 0U) && (asr_read_fail_count > 0U))
+  /* The verdict drives the light, so LED and UART cannot disagree. The
+   * earlier version lit "bus dead" from a read failure while the UART
+   * claimed the bus was clocking fine.
+   *
+   *   verdict+1 slow blinks, then a 2 s gap, repeating:
+   *     1 blink  = PASS           (bus alive, module quiet)
+   *     2 blinks = NO_DEVICE      (bus clocked, nothing answered)
+   *     3 blinks = DEVICE_SILENT  (answered, but no valid code)
+   *     4 blinks = BUS_STUCK      (line held low / never clocked)
+   *     5 blinks = NO_PULLUP      (fit an external pull-up)
+   */
+  if (in_gap != 0U)
   {
-    /* Bus dead: solid on. */
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);
-    next_tick = now + 100U;
+    led_on = 0U;
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);      /* off */
+    in_gap = 0U;
+    next_tick = now + 2000U;    /* long gap: makes groups countable */
     return;
   }
 
-  if (asr_selftest_verdict == ASR_VERDICT_PASS)
+  if (blinks_left == 0U)
   {
-    /* Bus alive, module silent: slow 1 Hz blink. */
-    phase ^= 1U;
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, phase ? GPIO_PIN_RESET : GPIO_PIN_SET);
-    next_tick = now + 500U;
-    return;
+    if (asr_selftest_verdict == ASR_VERDICT_PENDING)
+    {
+      /* Self-test still running: stay dark rather than show a stale code. */
+      led_on = 0U;
+      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);
+      next_tick = now + 200U;
+      return;
+    }
+
+    blinks_left = (uint8_t)(asr_selftest_verdict + 1U);
+    if (blinks_left > 5U)
+    {
+      blinks_left = 5U;
+    }
   }
 
-  /* No device: slow blink too, distinguishable by the UART verdict. */
-  phase ^= 1U;
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, phase ? GPIO_PIN_RESET : GPIO_PIN_SET);
-  next_tick = now + 500U;
+  if (led_on == 0U)
+  {
+    led_on = 1U;
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);    /* on  */
+    next_tick = now + 120U;
+  }
+  else
+  {
+    led_on = 0U;
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);      /* off */
+    next_tick = now + 180U;
+
+    if (blinks_left > 0U)
+    {
+      blinks_left--;
+    }
+    if (blinks_left == 0U)
+    {
+      in_gap = 1U;   /* group finished; take the long gap next time */
+    }
+  }
 }
 #endif /* ASR_USE_HEARTBEAT_LED */
 
