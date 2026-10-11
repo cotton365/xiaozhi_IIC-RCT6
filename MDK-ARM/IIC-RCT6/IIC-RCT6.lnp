@@ -1,0 +1,26 @@
+--cpu Cortex-M3
+"iic-rct6\startup_stm32f103xe.o"
+"iic-rct6\main.o"
+"iic-rct6\gpio.o"
+"iic-rct6\i2c.o"
+"iic-rct6\usart.o"
+"iic-rct6\stm32f1xx_it.o"
+"iic-rct6\stm32f1xx_hal_msp.o"
+"iic-rct6\stm32f1xx_hal_gpio_ex.o"
+"iic-rct6\stm32f1xx_hal_i2c.o"
+"iic-rct6\stm32f1xx_hal.o"
+"iic-rct6\stm32f1xx_hal_rcc.o"
+"iic-rct6\stm32f1xx_hal_rcc_ex.o"
+"iic-rct6\stm32f1xx_hal_gpio.o"
+"iic-rct6\stm32f1xx_hal_dma.o"
+"iic-rct6\stm32f1xx_hal_cortex.o"
+"iic-rct6\stm32f1xx_hal_pwr.o"
+"iic-rct6\stm32f1xx_hal_flash.o"
+"iic-rct6\stm32f1xx_hal_flash_ex.o"
+"iic-rct6\stm32f1xx_hal_exti.o"
+"iic-rct6\stm32f1xx_hal_uart.o"
+"iic-rct6\system_stm32f1xx.o"
+--strict --scatter "IIC-RCT6\IIC-RCT6.sct"
+--summary_stderr --info summarysizes --map --load_addr_map_info --xref --callgraph --symbols
+--info sizes --info totals --info unused --info veneers
+--list "IIC-RCT6.map" -o IIC-RCT6\IIC-RCT6.axf
