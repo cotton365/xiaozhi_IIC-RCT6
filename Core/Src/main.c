@@ -33,67 +33,79 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
-/* Self-test verdict, reported on UART and (optionally) by LED blink code. */
+/* Where the bring-up state machine currently is. Purely for observation. */
 typedef enum
 {
-  ASR_VERDICT_PENDING       = 0xFFU,  /* self-test not finished yet        */
-  ASR_VERDICT_PASS          = 0x00U,  /* bus alive, module quiet (reads 0x00) */
-  ASR_VERDICT_NO_DEVICE     = 0x01U,  /* bus clocks, but nobody ACKs        */
-  ASR_VERDICT_DEVICE_SILENT = 0x02U,  /* ACKs, but never returns a valid code */
-  ASR_VERDICT_BUS_STUCK     = 0x03U,  /* a line held low                    */
-  ASR_VERDICT_NO_PULLUP     = 0x04U   /* no external pull-up fitted -- the
-                                       * bus only looks high because of the
-                                       * MCU's own weak internal pull-up      */
-} ASR_Verdict_t;
+  MCP_STATE_PROBING = 0U,   /* nothing ACKed at 0x55 yet            */
+  MCP_STATE_SILENT  = 1U,   /* 0x55 ACKs, registration sent, no frames yet */
+  MCP_STATE_ACTIVE  = 2U    /* frames are arriving                  */
+} MCP_State_t;
 
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-/* ---- WonderLLM / CI1302 offline-voice slave ---------------------------- */
-/* 7-bit address 0x34 -> HAL 8-bit form 0x68. Some units are reconfigured to
- * 7-bit 0x33 through their own register 0x03 (HAL 8-bit form 0x66).
- * Both are probed at startup; whichever ACKs is latched. */
-#define ASR_ADDR_7BIT_PRIMARY    (0x34U)
-#define ASR_ADDR_7BIT_ALTERNATE  (0x33U)
-#define ASR_ADDR_PRIMARY         (ASR_ADDR_7BIT_PRIMARY   << 1)  /* 0x68 */
-#define ASR_ADDR_ALTERNATE       (ASR_ADDR_7BIT_ALTERNATE << 1)  /* 0x66 */
+/* ==========================================================================
+ * WonderLLM MCP over I2C  --  STM32 is the I2C MASTER, ESP32-S3 the SLAVE.
+ *
+ * The ESP32-S3 answers at 7-bit 0x55 and speaks "MCP" framing:
+ *     [8-byte header][payload ...][XOR checksum]
+ *
+ * !! READS ARE PURE READS. THERE IS NO REGISTER ADDRESS.
+ *    Do NOT send 0x64 (or any other register byte) before reading --
+ *    that was the CI1302 register protocol and it does not exist here.
+ *    Verified against the vendor master source (WonderLLM.cpp):
+ *        Wire.requestFrom(WonderLLM_SLAVE_ADDRESS, size, stop_flag);
+ *    whose STM32 equivalent is HAL_I2C_Master_Receive().
+ *
+ * Header layout (byte order verified character-by-character against the
+ * vendor's receive_frame_head()):
+ *     [0]     0xAA               magic
+ *     [1]     0x55               magic
+ *     [2..3]  data_len           BIG endian
+ *     [4..5]  part_id            LITTLE endian
+ *     [6..7]  part_num           LITTLE endian
+ * ======================================================================== */
+#define MCP_ADDR_7BIT         0x55U
+#define MCP_ADDR_HAL_W        ((uint16_t)(MCP_ADDR_7BIT << 1))         /* 0xAA */
+#define MCP_ADDR_HAL_R        ((uint16_t)((MCP_ADDR_7BIT << 1) | 1U))  /* 0xAB */
 
-#define ASR_RESULT_REGISTER      0x64U     /* one byte of result            */
+#define MCP_HDR_LEN           8U
+#define MCP_DATA_LEN_MAX      31U      /* vendor cap: 1..31 */
+#define MCP_MAGIC_0           0xAAU
+#define MCP_MAGIC_1           0x55U
 
-/* Bus timing. 100 kHz standard mode: a 3-byte transaction is ~90 us, so
- * 10 ms is already a 100x margin. Startup probe uses a longer one because
- * the module may still be settling after its own power-up. */
-#define ASR_I2C_TIMEOUT_MS       10U
-#define ASR_PROBE_TIMEOUT_MS     500U
-#define ASR_POLL_INTERVAL_MS     100U
+#define MCP_TX_TIMEOUT_MS     100U
+#define MCP_RX_TIMEOUT_MS     20U
 
-/* Bus recovery: 9 SCL pulses (the I2C spec's unstick procedure), plus a
- * manual STOP. Only attempted after repeated failure, or immediately when
- * the peripheral is hard-latched in BUSY. */
-#define ASR_RECOVER_THRESHOLD    5U        /* consecutive fails before retry */
-#define ASR_RECOVER_COOLDOWN_MS  500U      /* min gap between recoveries     */
+#define MCP_POLL_INTERVAL_MS  100U
+#define MCP_REG_RETRY_MS      2000U    /* re-send registration while no JSON yet */
+#define MCP_STATUS_INTERVAL_MS 5000U   /* periodic counter summary */
 
-/* De-duplication window. The module's result hold time is NOT knowable from
- * source, so this is a starting guess; the raw trace below measures it.
- * A command counts as new if the value changed OR this window elapsed. */
-#define ASR_DUP_WINDOW_MS        700U
+/* A frame is treated as "the model answered" iff its payload looks like the
+ * start of a JSON object. Registration retries until that happens. */
+#define MCP_JSON_PREFIX       '{'
 
-/* Raw trace ring buffer: every successful read is recorded verbatim, with
- * no de-duplication. This is what tells you the module's hold time. */
-#define ASR_TRACE_LEN            32U
+/* The LED shows live activity, not history: it stays solid only while frames
+ * are actually arriving. */
+#define MCP_ACTIVITY_WINDOW_MS 2000U
 
-/* Self-test bounds. */
-#define ASR_SELFTEST_ATTEMPTS    20U
-#define ASR_SELFTEST_MIN_OK      18U       /* of 20 -> PASS                  */
-#define ASR_SELFTEST_PROBE_GAP   50U
-#define ASR_SELFTEST_READ_GAP    100U
+/* !! The vendor requires 400 kHz WHILE TRANSMITTING MCP JSON.
+ *    Vendor comment (WonderLLM_porting.cpp), translated:
+ *      "For longer strings (especially Chinese) you MUST raise the I2C rate
+ *       to 400,000, otherwise WonderLLM cannot receive the data completely."
+ *    Reads are a handful of bytes and are fine at 100 kHz. */
+#define MCP_I2C_SPEED_WRITE   400000U
+#define MCP_I2C_SPEED_READ    100000U
 
-/* Optional second observation channel: the board's red LED0 on PA8.
- * NOTE: PC13 is NOT an LED on the MiniSTM32 V4 (it is touch CS). PA8 is
- * LED0 (red). Set to 0 to compile the blinker out entirely. */
-#define ASR_USE_HEARTBEAT_LED    1U
+/* Raw receive buffer. Static, not on the stack -- fragmented frames can run
+ * past 64 bytes, and the main loop must keep its stack small. */
+#define MCP_RX_BUF_LEN        256U
+
+/* Heartbeat LED: board LED0 (red) on PA8.
+ * NOTE: PC13 is NOT an LED on this board (it is the touch panel CS). */
+#define MCP_USE_HEARTBEAT_LED 1U
 
 /* USER CODE END PD */
 
@@ -106,56 +118,39 @@ typedef enum
 
 /* USER CODE BEGIN PV */
 
-/* ---- Live state (all volatile: Optim=4 is -O3, a non-volatile static
- * would be kept in a register and be invisible to the debugger) ---------- */
+/* ---- Live observation state -------------------------------------------
+ * All volatile: the project builds at -O3, so a non-volatile static can be
+ * kept in a register and become invisible to the debugger. ---------------- */
 
-volatile uint8_t  asr_device_online   = 0U;   /* hysteresis, see below      */
-volatile uint16_t asr_i2c_address     = ASR_ADDR_PRIMARY;
-volatile uint8_t  asr_result          = 0U;   /* latest raw byte, verbatim  */
-volatile uint8_t  asr_last_command    = 0U;   /* last de-duplicated command */
-volatile uint8_t  asr_new_command     = 0U;   /* consume-once flag, host clears */
-volatile uint32_t asr_command_count   = 0U;
-volatile uint32_t asr_dup_suppressed  = 0U;   /* reads swallowed by the window */
-volatile uint32_t asr_read_ok_count   = 0U;
-volatile uint32_t asr_read_fail_count = 0U;
-volatile uint32_t asr_consecutive_fail = 0U;
-volatile uint32_t asr_online_flaps    = 0U;   /* online<->offline transitions  */
-volatile uint32_t asr_last_command_tick = 0U;
-volatile uint8_t  asr_last_raw_nonzero  = 0U;
-volatile uint32_t asr_last_poll_tick    = 0U;   /* non-blocking poll schedule */
+volatile uint32_t mcp_state            = MCP_STATE_PROBING;
+volatile uint32_t mcp_probe_count      = 0U;  /* failed probes            */
+volatile uint32_t mcp_probe_ok_count   = 0U;  /* successful ACKs at 0x55  */
+volatile uint32_t mcp_register_attempts = 0U; /* registration bursts sent */
+volatile uint32_t mcp_register_ok      = 0U;
+volatile uint32_t mcp_frames_ok        = 0U;  /* fully valid frames       */
+volatile uint32_t mcp_json_frames      = 0U;  /* frames whose payload is JSON */
+volatile uint32_t mcp_bad_header       = 0U;
+volatile uint32_t mcp_bad_checksum     = 0U;
+volatile uint32_t mcp_read_fail        = 0U;  /* genuine I2C fault (BUSY/TIMEOUT) */
+volatile uint32_t mcp_nack_count       = 0U;  /* idle NACK -- NOT a fault */
+volatile uint32_t mcp_tool_calls       = 0U;  /* frames containing tool_name */
+volatile uint32_t mcp_finish_sent      = 0U;  /* action_finish replies    */
+volatile uint32_t mcp_bus_recover_count = 0U; /* bus resets performed     */
+volatile uint32_t mcp_tx_total_bytes   = 0U;  /* bytes clocked out, for sizing checks */
+volatile uint32_t mcp_last_status      = 0U;  /* last HAL status          */
+volatile uint32_t mcp_last_error       = 0U;  /* last HAL_I2C error code  */
+volatile uint32_t mcp_i2c_speed_hz     = 0U;  /* speed currently programmed */
 
-/* HAL status/error of the most recent transaction. Keil's Watch window does
- * not resolve the HAL_I2C_ERROR_* names, so compare numerically:
- *   HAL_I2C_ERROR_AF      = 0x04  -> address not acknowledged (bus is fine)
- *   HAL_I2C_ERROR_TIMEOUT = 0x20  -> bus did not clock (pull-ups / stuck) */
-volatile HAL_StatusTypeDef asr_i2c_status = HAL_ERROR;
-volatile uint32_t          asr_i2c_error  = HAL_I2C_ERROR_NONE;
+/* Last frame, for the debugger and for printing. */
+volatile uint8_t  mcp_last_header[MCP_HDR_LEN];
+volatile uint16_t mcp_last_len    = 0U;
+volatile uint8_t  mcp_last_payload[MCP_RX_BUF_LEN];
 
-/* Raw trace: every successful read, in order, no filtering whatsoever.
- * Read this to learn the module's result hold time (Step 6b). */
-volatile uint8_t  asr_raw_trace[ASR_TRACE_LEN];
-volatile uint8_t  asr_raw_trace_head  = 0U;   /* next write index           */
-volatile uint8_t  asr_raw_trace_full  = 0U;
-
-/* Bus recovery counters. recover_count > 0 during a quiet period means the
- * bus is degrading, not that a single command was missed. */
-volatile uint32_t asr_recover_count    = 0U;
-volatile uint32_t asr_recover_ok_count = 0U;
-volatile uint32_t asr_last_recover_tick = 0U;
-
-/* Self-test. verdict is what you look at first. */
-volatile uint8_t  asr_selftest_stage    = 0U;
-volatile uint8_t  asr_selftest_verdict  = ASR_VERDICT_PENDING;
-volatile uint32_t asr_selftest_read_attempts = 0U;
-volatile uint32_t asr_selftest_read_ok  = 0U;
-volatile uint8_t  asr_selftest_bus_low  = 0U;  /* 1 = a line held low       */
-volatile uint8_t  asr_selftest_pullup_present = 0U;  /* 1 = external pull-up found */
-
-/* Per-candidate address probe results, indexed [0]=0x68, [1]=0x66.
- * probe_result: 0 = ACK, 0xFF = no ACK. */
-volatile uint8_t  asr_addr_probe_result[2] = { 0xFFU, 0xFFU };
-volatile uint32_t asr_probe_status[2]      = { 0U, 0U };
-volatile uint32_t asr_probe_error[2]       = { 0U, 0U };
+static uint8_t  mcp_rx_buf[MCP_RX_BUF_LEN];
+static uint32_t mcp_last_poll_tick     = 0U;
+static uint32_t mcp_last_register_tick = 0U;
+static uint32_t mcp_last_status_tick   = 0U;
+static uint32_t mcp_last_frame_tick    = 0U;  /* drives LED activity, see MCP_ACTIVITY_WINDOW_MS */
 
 /* USER CODE END PV */
 
@@ -163,27 +158,18 @@ volatile uint32_t asr_probe_error[2]       = { 0U, 0U };
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 
-/* Bus bit-level recovery (9 clocks + STOP), then re-init via MX_I2C1_Init. */
-static HAL_StatusTypeDef ASR_BusRecover(void);
-/* Read result register 0x64 once. Wraps HAL_I2C_Mem_Read + error capture. */
-static HAL_StatusTypeDef ASR_ReadResult(uint16_t addr8, uint8_t *out);
-/* Probe candidates, latch whichever ACKs. Returns chosen address. */
-static uint16_t ASR_ProbeAddress(void);
-/* Sweep the 7-bit address space and report every address that ACKs. */
-static void ASR_BusScan(void);
-/* Bounded self-test with a verdict. Runs without any speech. */
-static void ASR_SelfTest(void);
-/* Push one sample into the raw trace ring. */
-static void ASR_TracePush(uint8_t value);
-/* Feed one successful sample through the de-duplication rule. */
-static void ASR_HandleSample(uint8_t value);
-/* Short busy-wait, ~us scale. Used only by bus recovery. */
-static void ASR_ShortDelay(uint32_t us);
-#if ASR_USE_HEARTBEAT_LED
-static void ASR_LedInit(void);
-static void ASR_LedService(void);   /* non-blocking, tick driven */
+static HAL_StatusTypeDef MCP_SetSpeed(uint32_t speed);
+static HAL_StatusTypeDef MCP_Probe(void);
+static HAL_StatusTypeDef MCP_SendBytes(const uint8_t *data, uint16_t len);
+static HAL_StatusTypeDef MCP_RegisterTools(void);
+static HAL_StatusTypeDef MCP_ReadFrame(uint8_t *out, uint16_t out_cap, uint16_t *out_len);
+static HAL_StatusTypeDef MCP_BusRecover(void);
+static void MCP_Dump(const uint8_t *data, uint16_t len);
+static const char *MCP_StateName(uint8_t code);
+#if MCP_USE_HEARTBEAT_LED
+static void MCP_LedInit(void);
+static void MCP_LedService(void);
 #endif
-static const char *ASR_VerdictName(uint8_t verdict);
 
 /* USER CODE END PFP */
 
@@ -191,13 +177,13 @@ static const char *ASR_VerdictName(uint8_t verdict);
 /* USER CODE BEGIN 0 */
 
 /* --------------------------------------------------------------------------
- * printf retarget onto USART1 (PA9/PA10 -> onboard CH340 -> same USB cable).
+ * printf retarget onto USART1 (PA9/PA10 -> onboard CH340 -> the same USB
+ * cable that powers/programs the board, so no extra hardware is needed).
  *
- * MicroLIB is OFF in this project (useUlib=0), so the full C library is
- * linked. Without the semihosting opt-out below, the linker pulls in the
- * semihosting stubs and the first printf() executes a BKPT that only a
- * debugger can service -- the board would silently stop with no output.
- * __use_no_semihosting plus these three stubs avoids that entirely.
+ * MicroLIB is OFF in this project, so the full C library is linked. Without
+ * the semihosting opt-out below, the linker pulls in the semihosting stubs
+ * and the first printf() executes a BKPT that only a debugger can service --
+ * the board would silently stop with no output at all.
  * ------------------------------------------------------------------------ */
 #pragma import(__use_no_semihosting)
 
@@ -261,56 +247,24 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 
-  /* Let the module finish its own power-up before touching the bus. */
-  HAL_Delay(1000U);
+  mcp_i2c_speed_hz = MCP_I2C_SPEED_READ;   /* matches MX_I2C1_Init: 100 kHz */
+  mcp_last_register_tick = HAL_GetTick();
 
-  memset((void *)asr_raw_trace, 0, sizeof(asr_raw_trace));
-
-#if ASR_USE_HEARTBEAT_LED
-  ASR_LedInit();
+#if MCP_USE_HEARTBEAT_LED
+  MCP_LedInit();
 #endif
 
-  printf("\r\n\r\n=== WonderLLM / CI1302 I2C bring-up ===\r\n");
-  printf("MCU STM32F103RCT6 @ %lu Hz, I2C1 PB6=SCL PB7=SDA, %s\r\n",
-         (unsigned long)SystemCoreClock,
-         "polls reg 0x64 every 100 ms");
-
-  /* One unconditional recovery before anything else: it clears whatever
-   * state a previous power cycle left on the bus and doubles as a first
-   * hardware sanity check. */
-  ASR_BusRecover();
-
-  ASR_SelfTest();
-
-  /* Stage 2 of the self-test already probed both addresses and latched
-   * whichever answered, so only re-probe when the address is genuinely in
-   * doubt -- the module may simply have been slower to boot than the MCU.
-   * Re-probing after a PASS or a stuck bus would just add startup delay. */
-  if ((asr_selftest_verdict != ASR_VERDICT_PASS) &&
-      (asr_selftest_verdict != ASR_VERDICT_BUS_STUCK) &&
-      (asr_selftest_verdict != ASR_VERDICT_NO_PULLUP))
-  {
-    ASR_ProbeAddress();
-
-    /* Neither documented address answered. Only a scan can distinguish
-     * "the module is somewhere undocumented" from "the module is not
-     * talking at all" -- and the bus must be healthy for the scan to mean
-     * anything, hence NO_PULLUP/BUS_STUCK were excluded above. */
-    if (asr_selftest_verdict == ASR_VERDICT_NO_DEVICE)
-    {
-      ASR_BusScan();
-    }
-  }
-
-  printf("Address in use: 0x%02X (7-bit 0x%02X)\r\n",
-         (unsigned)asr_i2c_address, (unsigned)(asr_i2c_address >> 1));
-  printf("Verdict: %u (%s)\r\n",
-         (unsigned)asr_selftest_verdict,
-         ASR_VerdictName(asr_selftest_verdict));
-  /* ASCII only: terminal/encoding varies, and Chinese UTF-8 in a serial
-   * window is a common source of confusing mojibake during bring-up. */
-  printf("Entering poll loop. Speak: qianjin / houtui / zuozhuan / youzhuan / tingzhi\r\n");
-  printf("(forward / backward / left / right / stop)\r\n\r\n");
+  printf("\r\n\r\n=== WonderLLM MCP bring-up (STM32 as I2C master) ===\r\n");
+  printf("MCU STM32F103RCT6 @ %lu Hz\r\n", (unsigned long)SystemCoreClock);
+  printf("I2C1 PB6=SCL PB7=SDA, slave 0x%02X (HAL write 0x%02X / read 0x%02X)\r\n",
+         (unsigned)MCP_ADDR_7BIT,
+         (unsigned)MCP_ADDR_HAL_W,
+         (unsigned)MCP_ADDR_HAL_R);
+  printf("\r\nSTARTUP ORDER THAT MATTERS:\r\n");
+  printf("  The module only accepts MCP tool registration during its own\r\n");
+  printf("  startup window. This firmware now retries registration every\r\n");
+  printf("  %u ms until frames start arriving.\r\n", (unsigned)MCP_REG_RETRY_MS);
+  printf("  => POWER-CYCLE THE ESP32-S3 MODULE NOW, while this runs.\r\n\r\n");
 
   /* USER CODE END 2 */
 
@@ -319,84 +273,177 @@ int main(void)
   while (1)
   {
     uint32_t now = HAL_GetTick();
-    uint8_t  received = 0U;
+    uint16_t got = 0U;
 
-    if ((now - asr_last_poll_tick) >= ASR_POLL_INTERVAL_MS)
+    if ((now - mcp_last_poll_tick) >= MCP_POLL_INTERVAL_MS)
     {
-      asr_last_poll_tick = now;
+      mcp_last_poll_tick = now;
 
-      asr_i2c_status = ASR_ReadResult(asr_i2c_address, &received);
-
-      if (asr_i2c_status == HAL_OK)
+      /* ---- Registration retry -------------------------------------------
+       * Re-send the tool registration periodically until a frame actually
+       * carries JSON, i.e. until the model has been given its tools and has
+       * responded.
+       *
+       * This deliberately does NOT stop at the first frame received. An
+       * earlier version keyed on mcp_frames_ok, so the very first 1-byte
+       * event frame (a CI1302 power-on/wake notice) permanently disabled
+       * registration -- and because the module only honours registration
+       * during its startup window, a later module reboot could then never be
+       * registered at all. That is why chatting with the model produced
+       * nothing on the bus.
+       * Re-sending costs one short write when already registered. -------- */
+      if ((mcp_json_frames == 0U) && ((now - mcp_last_register_tick) >= MCP_REG_RETRY_MS))
       {
-        asr_consecutive_fail = 0U;
-        asr_i2c_error = HAL_I2C_ERROR_NONE;
+        mcp_last_register_tick = now;
+        mcp_register_attempts++;
 
-        /* Recover the online flag only after hysteresis cleared it; this
-         * keeps a single stray NACK from flapping the flag at 10 Hz. */
-        if (asr_device_online == 0U)
+        if (MCP_Probe() == HAL_OK)
         {
-          asr_device_online = 1U;
+          mcp_probe_ok_count++;
+
+          if (MCP_RegisterTools() == HAL_OK)
+          {
+            mcp_register_ok++;
+            mcp_state = (uint32_t)MCP_STATE_SILENT;
+            printf("[%lu ms] registration #%lu sent (0x%02X ACK, %lu bytes total)\r\n",
+                   (unsigned long)now, (unsigned long)mcp_register_ok,
+                   (unsigned)MCP_ADDR_7BIT, (unsigned long)mcp_tx_total_bytes);
+          }
+          else
+          {
+            mcp_last_error = HAL_I2C_GetError(&hi2c1);
+            printf("[%lu ms] registration FAILED  status=%lu err=0x%03lX\r\n",
+                   (unsigned long)now, (unsigned long)mcp_last_status,
+                   (unsigned long)mcp_last_error);
+          }
+        }
+        else
+        {
+          mcp_probe_count++;
+          mcp_last_error = HAL_I2C_GetError(&hi2c1);
+          printf("[%lu ms] 0x%02X not responding  err=0x%03lX\r\n",
+                 (unsigned long)now, (unsigned)MCP_ADDR_7BIT,
+                 (unsigned long)mcp_last_error);
+        }
+      }
+
+      /* ---- Receive one frame -------------------------------------------- */
+      mcp_last_status = (uint32_t)MCP_ReadFrame(mcp_rx_buf,
+                                                (uint16_t)(MCP_RX_BUF_LEN - 1U),
+                                                &got);
+
+      if (mcp_last_status == (uint32_t)HAL_OK)
+      {
+        mcp_frames_ok++;
+        mcp_state = (uint32_t)MCP_STATE_ACTIVE;
+        mcp_last_len = got;
+        mcp_last_frame_tick = now;
+        mcp_read_fail = 0U;   /* any success clears the consecutive-fault run */
+
+        memset((void *)mcp_last_payload, 0, sizeof(mcp_last_payload));
+        if (got < MCP_RX_BUF_LEN)
+        {
+          memcpy((void *)mcp_last_payload, mcp_rx_buf, got);
         }
 
-        asr_result = received;
-        asr_read_ok_count++;
+        if (mcp_rx_buf[0] == (uint8_t)MCP_JSON_PREFIX)
+        {
+          mcp_json_frames++;
+        }
 
-        ASR_TracePush(received);
-        ASR_HandleSample(received);
+        printf("\r\n=== MCP FRAME #%lu  len=%u  header=%02X %02X %02X %02X %02X %02X %02X %02X ===\r\n",
+               (unsigned long)mcp_frames_ok, (unsigned)got,
+               (unsigned)mcp_last_header[0], (unsigned)mcp_last_header[1],
+               (unsigned)mcp_last_header[2], (unsigned)mcp_last_header[3],
+               (unsigned)mcp_last_header[4], (unsigned)mcp_last_header[5],
+               (unsigned)mcp_last_header[6], (unsigned)mcp_last_header[7]);
+        MCP_Dump(mcp_rx_buf, got);
+
+        if ((got == 1U) && (mcp_rx_buf[0] < MCP_JSON_PREFIX))
+        {
+          /* The module's own status broadcast, not a model tool call.
+           * State 5 (listening) means it is up and ready for speech. */
+          printf("    ^ module status: %u = %s\r\n",
+                 (unsigned)mcp_rx_buf[0], MCP_StateName(mcp_rx_buf[0]));
+        }
+
+        /* A tool call carries a tool_name field. Acknowledge it, or the
+         * module waits forever: both vendor tools are registered with
+         * "block":"true". */
+        if (strstr((char *)mcp_rx_buf, "tool_name") != NULL)
+        {
+          mcp_tool_calls++;
+          printf(">>> TOOL CALL -- replying action_finish\r\n");
+
+          if (MCP_SendBytes((const uint8_t *)"{\"command\":\"action_finish\",\"params\":\"true\"}",
+                            (uint16_t)(sizeof("{\"command\":\"action_finish\",\"params\":\"true\"}") - 1U)) == HAL_OK)
+          {
+            mcp_finish_sent++;
+            printf("    action_finish sent\r\n");
+          }
+          else
+          {
+            printf("    action_finish FAILED err=0x%03lX\r\n",
+                   (unsigned long)HAL_I2C_GetError(&hi2c1));
+          }
+        }
       }
       else
       {
-        asr_read_fail_count++;
-        asr_consecutive_fail++;
+        mcp_last_error = HAL_I2C_GetError(&hi2c1);
 
-        /* Capture the error code BEFORE classifying it. It must be read
-         * right after the failed transaction; using the value left over
-         * from the previous iteration would classify this failure with
-         * stale information. */
-        asr_i2c_error = HAL_I2C_GetError(&hi2c1);
-
-        /* HAL_BUSY with no error code means the peripheral itself is
-         * latched -- retrying cannot help, only recovery can. The internal
-         * BUSY check in HAL_I2C_Mem_Read is a hard-coded 25 ms and is not
-         * affected by our timeout argument. */
-        if ((asr_i2c_status == HAL_BUSY) && (asr_i2c_error == HAL_I2C_ERROR_NONE))
+        /* An idle slave simply does not answer a read request, so NACK
+         * (HAL_I2C_ERROR_AF) is the NORMAL "no frame waiting" result -- the
+         * vendor host treats it the same way and just retries. Counting it as
+         * a fault used to trigger MCP_BusRecover() every 2 seconds while
+         * idle, and that reset tears the peripheral down and bit-bangs
+         * SCL/SDA, which can cut across a transfer the module is starting.
+         *
+         * Only a genuine bus fault (BUSY latched, or the bus never clocked)
+         * justifies recovery. */
+        if ((mcp_last_error & (uint32_t)HAL_I2C_ERROR_AF) != 0U)
         {
-          if (ASR_BusRecover() == HAL_OK)
-          {
-            asr_recover_ok_count++;
-          }
-          asr_last_recover_tick = HAL_GetTick();
+          mcp_nack_count++;      /* expected while nothing is being sent */
         }
-        else if (asr_consecutive_fail >= ASR_RECOVER_THRESHOLD)
+        else
         {
-          /* Cool down so a genuinely dead bus does not become a recovery
-           * storm that also destroys our ability to observe what is
-           * happening. */
-          if ((HAL_GetTick() - asr_last_recover_tick) >= ASR_RECOVER_COOLDOWN_MS)
-          {
-            if (ASR_BusRecover() == HAL_OK)
-            {
-              asr_recover_ok_count++;
-            }
-            asr_last_recover_tick = HAL_GetTick();
-          }
-        }
+          mcp_read_fail++;
 
-        if ((asr_device_online != 0U) &&
-            (asr_consecutive_fail >= ASR_RECOVER_THRESHOLD))
-        {
-          asr_device_online = 0U;
-          asr_online_flaps++;
+          if (mcp_read_fail >= 20U)
+          {
+            mcp_read_fail = 0U;
+            mcp_bus_recover_count++;
+            printf("[%lu ms] bus fault err=0x%03lX -- recovering (#%lu)\r\n",
+                   (unsigned long)now, (unsigned long)mcp_last_error,
+                   (unsigned long)mcp_bus_recover_count);
+            MCP_BusRecover();
+          }
         }
       }
 
-      asr_i2c_error = HAL_I2C_GetError(&hi2c1);
+      /* ---- Periodic status summary ---------------------------------------
+       * Without this, "no output" is ambiguous: it could mean the module is
+       * quiet (idle, normal) or that every read is failing (broken). ----- */
+      if ((now - mcp_last_status_tick) >= MCP_STATUS_INTERVAL_MS)
+      {
+        mcp_last_status_tick = now;
+        printf("[%lu ms] state=%lu ack=%lu reg=%lu frames=%lu json=%lu tool=%lu "
+               "nack=%lu rdfail=%lu badhdr=%lu badchk=%lu\r\n",
+               (unsigned long)now, (unsigned long)mcp_state,
+               (unsigned long)mcp_probe_ok_count,
+               (unsigned long)mcp_register_ok,
+               (unsigned long)mcp_frames_ok,
+               (unsigned long)mcp_json_frames,
+               (unsigned long)mcp_tool_calls,
+               (unsigned long)mcp_nack_count,
+               (unsigned long)mcp_read_fail,
+               (unsigned long)mcp_bad_header,
+               (unsigned long)mcp_bad_checksum);
+      }
     }
 
-#if ASR_USE_HEARTBEAT_LED
-    /* Runs every iteration, independent of the poll schedule. */
-    ASR_LedService();
+#if MCP_USE_HEARTBEAT_LED
+    MCP_LedService();
 #endif
 
     /* USER CODE END WHILE */
@@ -448,71 +495,323 @@ void SystemClock_Config(void)
 /* USER CODE BEGIN 4 */
 
 /* --------------------------------------------------------------------------
- * Short busy-wait in the microsecond range. Used only by bus recovery, where
- * the exact clock rate is irrelevant (anything from ~50 kHz to ~400 kHz
- * successfully unsticks a slave). HAL_Delay(1) would be 1 ms per half clock.
+ * Reprogram the I2C bus speed at runtime.
+ *
+ * The vendor requires 400 kHz while sending MCP JSON and we use 100 kHz for
+ * the short reads, so the speed has to change at runtime.
+ *
+ * Note on the F1 HAL: HAL_I2C_Init() only calls HAL_I2C_MspInit() when
+ * State == HAL_I2C_STATE_RESET, so calling it here skips MspInit. That is
+ * harmless -- the pins are already AF_OD from the first init and the HAL
+ * reprograms CCR/FREQ either way. Do NOT "fix" this by calling DeInit first:
+ * that would tear the pins down and they would stay plain GPIO inputs.
  * ------------------------------------------------------------------------ */
-static void ASR_ShortDelay(uint32_t us)
+static HAL_StatusTypeDef MCP_SetSpeed(uint32_t speed)
 {
-  /* ~72 MHz core, roughly 5-6 cycles per loop iteration at -O3. */
-  volatile uint32_t n = us * 12U;
-  while (n-- > 0U)
+  if (mcp_i2c_speed_hz == speed)
   {
+    return HAL_OK;
   }
+
+  hi2c1.Init.ClockSpeed = speed;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  mcp_i2c_speed_hz = speed;
+  return HAL_OK;
 }
 
 /* --------------------------------------------------------------------------
- * Bus recovery: the I2C spec's unstick procedure.
- *
- * If a slave is mid-transfer and holding SDA low, the master must clock it
- * free. Order matters: HAL_I2C_DeInit() routes through HAL_I2C_MspDeInit(),
- * which disables the I2C1 clock and resets PB6/PB7, so the pins are free
- * to bit-bang only after it runs.
+ * Address-only ACK test. This is what the scan already proved works.
  * ------------------------------------------------------------------------ */
-static HAL_StatusTypeDef ASR_BusRecover(void)
+static HAL_StatusTypeDef MCP_Probe(void)
+{
+  MCP_SetSpeed(MCP_I2C_SPEED_READ);
+  return HAL_I2C_IsDeviceReady(&hi2c1, MCP_ADDR_HAL_W, 2U, 20U);
+}
+
+/* --------------------------------------------------------------------------
+ * Send a byte stream to the module: ONE transaction, no chunking.
+ *
+ * An earlier version split the payload into 32-byte chunks and put a STOP
+ * after each one. That was wrong on both counts:
+ *   - the vendor's Python host sends the whole JSON in a single transaction
+ *   - the vendor's Arduino host chunks with Wire.endTransmission(false), i.e.
+ *     a repeated START and NO stop between chunks
+ * Neither releases the bus mid-message. A STOP after every 32 bytes makes the
+ * slave see ~14 separate short messages instead of one 422-byte JSON, so the
+ * registration is fragmented and discarded -- which is exactly why tool
+ * registration appeared to succeed but the model never called anything.
+ *
+ * Chunking is also unnecessary here: HAL_I2C_Master_Transmit takes a uint16_t
+ * size and clocks it all out in one blocking transfer. At 400 kHz, 422 bytes
+ * take about 9.5 ms -- well inside MCP_TX_TIMEOUT_MS.
+ * ------------------------------------------------------------------------ */
+static HAL_StatusTypeDef MCP_SendBytes(const uint8_t *data, uint16_t len)
+{
+  HAL_StatusTypeDef st;
+
+  /* 400 kHz is mandatory for MCP JSON (see MCP_I2C_SPEED_WRITE). */
+  if (MCP_SetSpeed(MCP_I2C_SPEED_WRITE) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  st = HAL_I2C_Master_Transmit(&hi2c1, MCP_ADDR_HAL_W,
+                               (uint8_t *)data, len, MCP_TX_TIMEOUT_MS);
+
+  if (st == HAL_OK)
+  {
+    mcp_tx_total_bytes += (uint32_t)len;
+  }
+
+  return st;
+}
+
+/* --------------------------------------------------------------------------
+ * Register the two robot tools, then switch the module into MCP mode.
+ *
+ * The wording is copied verbatim from the project's authoritative tool
+ * definitions (robot-planner-skill/i2c/act_tool_strings.h), which are kept
+ * aligned with acts.json. Earlier this file used hand-written paraphrase --
+ * including a different command sentence and ASCII colons where the original
+ * has the full-width colon U+FF1A -- on the theory that any equivalent text
+ * would do. Since the model only ever sees this text, any drift changes what
+ * it believes the tool does, so the reference strings are reproduced exactly.
+ * ------------------------------------------------------------------------ */
+/* ARM Compiler 5 reads source in the system codepage (GBK on a Chinese
+ * Windows install), NOT UTF-8, so literal Chinese here is misparsed and can
+ * even swallow the closing quote via a stray 0x5C byte. The text below is
+ * therefore stored as explicit UTF-8 byte escapes, split into separate
+ * literals at every ASCII boundary so no \x escape can absorb a following
+ * hex digit ("\x82d" would otherwise be read as one escape). The bytes sent
+ * to the module are identical UTF-8, so the JSON stays readable to the model.
+ *
+ * NOTE: "\xE3\x80\x82" is U+3002 (。), "\xEF\xBC\x8C" is U+FF0C (，) and
+ * "\xEF\xBC\x9A" is U+FF1A (：) -- the full-width forms, as in the original. */
+static const char MCP_TOOL_MOVE[] =
+  "{\"tool_name\":\"self.robot.move_linear\","
+  "\"command\":\""
+  "\xE4\xBB\x85\xE5\x9C\xA8\xE7\x94\xA8\xE6\x88\xB7\xE8\xA6\x81\xE6\xB1\x82\xE7\x9B\xB4\xE7\xBA\xBF\xE7\xA7\xBB\xE5\x8A\xA8\xEF\xBC\x8C\xE4\xB8\x94\xE8\xB7\xAF\xE5\xBE\x84\xE5\xAE\x89\xE5\x85\xA8\xE6\x98\x8E\xE7\xA1\xAE\xE6\x97\xB6\xE8\xB0\x83\xE7\x94\xA8\xE3\x80\x82"
+  "heading_deg"
+  "\xE6\x98\xAF\xE7\x9B\xB8\xE5\xAF\xB9\xE5\xBD\x93\xE5\x89\x8D\xE6\x9C\x9D\xE5\x90\x91\xE7\x9A\x84\xE8\xA7\x92\xE5\xBA\xA6\xEF\xBC\x8C\xE5\x8F\xB3\xE8\xBD\xAC\xE4\xB8\xBA\xE6\xAD\xA3\xEF\xBC\x8C\xE5\xB7\xA6\xE8\xBD\xAC\xE4\xB8\xBA\xE8\xB4\x9F\xE3\x80\x82"
+  "speed_pct"
+  "\xE6\x98\xAF\xE9\x80\x9F\xE5\xBA\xA6\xE7\x99\xBE\xE5\x88\x86\xE6\xAF\x94\xE3\x80\x82"
+  "duration_ms"
+  "\xE6\x98\xAF\xE6\x9C\x89\xE9\x99\x90\xE8\xBF\x90\xE5\x8A\xA8\xE6\x97\xB6\xE9\x97\xB4\xE3\x80\x82\","
+  "\"params\":[[\"heading_deg\",\"int\",-180,180],"
+  "[\"speed_pct\",\"int\",0,50],[\"duration_ms\",\"int\",100,3000]],"
+  "\"block\":\"true\",\"return\":\"false\"}";
+
+static const char MCP_TOOL_ARC[] =
+  "{\"tool_name\":\"self.robot.drive_arc\","
+  "\"command\":\""
+  "\xE4\xBB\x85\xE5\x9C\xA8\xE7\x94\xA8\xE6\x88\xB7\xE8\xA6\x81\xE6\xB1\x82\xE8\xBF\x9E\xE7\xBB\xAD\xE6\x9B\xB2\xE7\xBA\xBF\xE8\xA1\x8C\xE9\xA9\xB6\xEF\xBC\x8C\xE4\xB8\x94\xE8\xB7\xAF\xE5\xBE\x84\xE5\xAE\x89\xE5\x85\xA8\xE6\x98\x8E\xE7\xA1\xAE\xE6\x97\xB6\xE8\xB0\x83\xE7\x94\xA8\xE3\x80\x82"
+  "turn"
+  "\xE5\x8F\xAA\xE8\x83\xBD\xE6\x98\xAF"
+  "left"
+  "\xE6\x88\x96"
+  "right"
+  "\xE3\x80\x82"
+  "radius_mm"
+  "\xE6\x98\xAF\xE6\x9B\xB2\xE7\xBA\xBF\xE5\x8D\x8A\xE5\xBE\x84\xE3\x80\x82"
+  "speed_pct"
+  "\xE6\x98\xAF\xE9\x80\x9F\xE5\xBA\xA6\xE7\x99\xBE\xE5\x88\x86\xE6\xAF\x94\xE3\x80\x82"
+  "duration_ms"
+  "\xE6\x98\xAF\xE6\x9C\x89\xE9\x99\x90\xE8\xBF\x90\xE5\x8A\xA8\xE6\x97\xB6\xE9\x97\xB4\xE3\x80\x82\","
+  "\"params\":[[\"turn\",\"string\"],[\"radius_mm\",\"int\",200,2000],"
+  "[\"speed_pct\",\"int\",0,35],[\"duration_ms\",\"int\",100,3000]],"
+  "\"block\":\"true\",\"return\":\"false\"}";
+
+static const char MCP_TOOL_FINISH[] = "{\"command\":\"mcp_setting\",\"params\":\"true\"}";
+
+static HAL_StatusTypeDef MCP_RegisterTools(void)
+{
+  HAL_StatusTypeDef st;
+
+  st = MCP_SendBytes((const uint8_t *)MCP_TOOL_MOVE, (uint16_t)(sizeof(MCP_TOOL_MOVE) - 1U));
+  HAL_Delay(100U);
+  if (st != HAL_OK) { return st; }
+
+  st = MCP_SendBytes((const uint8_t *)MCP_TOOL_ARC, (uint16_t)(sizeof(MCP_TOOL_ARC) - 1U));
+  HAL_Delay(100U);
+  if (st != HAL_OK) { return st; }
+
+  st = MCP_SendBytes((const uint8_t *)MCP_TOOL_FINISH, (uint16_t)(sizeof(MCP_TOOL_FINISH) - 1U));
+  HAL_Delay(100U);
+
+  /* Back to the read speed for the short frame reads. */
+  MCP_SetSpeed(MCP_I2C_SPEED_READ);
+  return st;
+}
+
+/* --------------------------------------------------------------------------
+ * Receive one complete MCP frame.
+ *
+ * Mirrors the vendor's receive_frame() exactly:
+ *   - read the 8-byte header, check the AA 55 magic
+ *   - data_len is big endian, part_id and part_num are little endian
+ *   - part_id must be 1, otherwise frames were dropped: abort rather than
+ *     deliver a truncated message
+ *   - per part: wait 10 ms, read data_len+1 bytes, last byte is the XOR
+ *   - between parts: wait 100 ms, then read the NEXT header
+ * ------------------------------------------------------------------------ */
+static HAL_StatusTypeDef MCP_ReadFrame(uint8_t *out, uint16_t out_cap, uint16_t *out_len)
+{
+  uint8_t  hdr[MCP_HDR_LEN];
+  uint8_t  part[MCP_DATA_LEN_MAX + 1U];
+  uint16_t data_len = 0U;
+  uint16_t part_id  = 0U;
+  uint16_t part_num = 0U;
+  uint16_t total    = 0U;
+  uint16_t i;
+  uint16_t k;
+  uint8_t  sum;
+  HAL_StatusTypeDef st;
+
+  MCP_SetSpeed(MCP_I2C_SPEED_READ);
+
+  /* ---- header 1 ---- */
+  st = HAL_I2C_Master_Receive(&hi2c1, MCP_ADDR_HAL_R, hdr, MCP_HDR_LEN, MCP_RX_TIMEOUT_MS);
+  if (st != HAL_OK)
+  {
+    return st;
+  }
+
+  memcpy((void *)mcp_last_header, hdr, MCP_HDR_LEN);
+
+  if ((hdr[0] != MCP_MAGIC_0) || (hdr[1] != MCP_MAGIC_1))
+  {
+    mcp_bad_header++;
+    return HAL_ERROR;
+  }
+
+  data_len = (uint16_t)(((uint16_t)hdr[2] << 8) | (uint16_t)hdr[3]);  /* big endian */
+  part_id  = (uint16_t)(((uint16_t)hdr[5] << 8) | (uint16_t)hdr[4]);  /* little     */
+  part_num = (uint16_t)(((uint16_t)hdr[7] << 8) | (uint16_t)hdr[6]);  /* little     */
+
+  if ((data_len == 0U) || (data_len > MCP_DATA_LEN_MAX))
+  {
+    mcp_bad_header++;
+    return HAL_ERROR;
+  }
+
+  /* Not the first fragment means data was lost before this point; the
+   * remainder would be a truncated JSON document. */
+  if ((part_id != 1U) || (part_num == 0U))
+  {
+    mcp_bad_header++;
+    return HAL_ERROR;
+  }
+
+  for (i = 1U; i <= part_num; i++)
+  {
+    HAL_Delay(10U);
+
+    st = HAL_I2C_Master_Receive(&hi2c1, MCP_ADDR_HAL_R, part,
+                                (uint16_t)(data_len + 1U), MCP_RX_TIMEOUT_MS);
+    if (st != HAL_OK)
+    {
+      return st;
+    }
+
+    sum = 0U;
+    for (k = 0U; k < data_len; k++)
+    {
+      sum = (uint8_t)(sum ^ part[k]);
+    }
+
+    if (part[data_len] != sum)
+    {
+      mcp_bad_checksum++;
+      return HAL_ERROR;
+    }
+
+    if ((uint16_t)(total + data_len) <= out_cap)
+    {
+      memcpy(out + total, part, data_len);
+      total = (uint16_t)(total + data_len);
+    }
+
+    /* ---- next header, when the message is fragmented ---- */
+    if (i < part_num)
+    {
+      HAL_Delay(100U);
+
+      st = HAL_I2C_Master_Receive(&hi2c1, MCP_ADDR_HAL_R, hdr,
+                                  MCP_HDR_LEN, MCP_RX_TIMEOUT_MS);
+      if (st != HAL_OK)
+      {
+        return st;
+      }
+
+      if ((hdr[0] != MCP_MAGIC_0) || (hdr[1] != MCP_MAGIC_1))
+      {
+        mcp_bad_header++;
+        return HAL_ERROR;
+      }
+
+      data_len = (uint16_t)(((uint16_t)hdr[2] << 8) | (uint16_t)hdr[3]);
+      if ((data_len == 0U) || (data_len > MCP_DATA_LEN_MAX))
+      {
+        mcp_bad_header++;
+        return HAL_ERROR;
+      }
+    }
+  }
+
+  out[total] = 0U;   /* NUL-terminate so strstr() is safe on a JSON payload */
+  *out_len = total;
+  return HAL_OK;
+}
+
+/* --------------------------------------------------------------------------
+ * Bus recovery: if a slave is mid-transfer holding SDA low, the master must
+ * clock it free. Nine SCL pulses then a manual STOP.
+ *
+ * DeInit is the correct teardown here: it sets State to RESET, so the
+ * following MX_I2C1_Init() really does re-run MspInit and restore AF_OD.
+ * (Using __HAL_I2C_DISABLE() instead leaves State at READY, MspInit is
+ * skipped, and the pins silently stay plain GPIO inputs -- which cost us a
+ * whole debugging session once already.)
+ * ------------------------------------------------------------------------ */
+static HAL_StatusTypeDef MCP_BusRecover(void)
 {
   GPIO_InitTypeDef gpio = {0};
-  uint8_t sda_seen_high = 0U;
   uint8_t i;
-  uint8_t finished = 0U;
+  uint8_t released = 0U;
 
-  asr_recover_count++;
+  HAL_I2C_DeInit(&hi2c1);
 
-  HAL_I2C_DeInit(&hi2c1);   /* releases PB6/PB7, disables I2C1 clock */
-
-  /* SCL as open-drain output: we only ever pull it low, the external
-   * pull-up provides the high level. */
+  /* SCL as open-drain output: we only ever pull it low; a pull-up makes the
+   * high level. SDA as a plain input so we can watch for release. */
   gpio.Pin   = GPIO_PIN_6;
   gpio.Mode  = GPIO_MODE_OUTPUT_OD;
   gpio.Pull  = GPIO_NOPULL;
   gpio.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(GPIOB, &gpio);
 
-  /* SDA as input so we can observe whether the slave has let go. */
   gpio.Pin  = GPIO_PIN_7;
   gpio.Mode = GPIO_MODE_INPUT;
   gpio.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOB, &gpio);
 
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);   /* release SCL */
-  ASR_ShortDelay(5U);
-
-  for (i = 0U; (i < 9U) && (finished == 0U); i++)
+  for (i = 0U; (i < 9U) && (released == 0U); i++)
   {
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);  /* SCL low  */
-    ASR_ShortDelay(5U);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);    /* SCL high */
-    ASR_ShortDelay(5U);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);   /* SCL low  */
+    HAL_Delay(1U);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);     /* SCL high */
+    HAL_Delay(1U);
 
-    /* Sample while SCL is high: a released SDA means we are done. */
     if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_SET)
     {
-      sda_seen_high = 1U;
-      finished = 1U;
+      released = 1U;
     }
   }
 
-  /* Manual STOP: SDA low while SCL high, then release SDA. */
+  /* Manual STOP. */
   gpio.Pin   = GPIO_PIN_7;
   gpio.Mode  = GPIO_MODE_OUTPUT_OD;
   gpio.Pull  = GPIO_NOPULL;
@@ -520,509 +819,101 @@ static HAL_StatusTypeDef ASR_BusRecover(void)
   HAL_GPIO_Init(GPIOB, &gpio);
 
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);   /* SDA low  */
-  ASR_ShortDelay(5U);
+  HAL_Delay(1U);
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);     /* SCL high */
-  ASR_ShortDelay(5U);
+  HAL_Delay(1U);
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);     /* SDA high */
-  ASR_ShortDelay(5U);
-
-  /* Hand the pins back to the peripheral by re-running the CubeMX init, so
-   * the AF_OD configuration cannot drift from what CubeMX generates. */
-  MX_I2C1_Init();
-
-  return (sda_seen_high != 0U) ? HAL_OK : HAL_ERROR;
-}
-
-/* --------------------------------------------------------------------------
- * One register-0x64 read. Exactly the transaction the reference host uses:
- * START, addr+W, 0x64, repeated START, addr+R, 1 byte, NACK, STOP --
- * which is what HAL_I2C_Mem_Read produces.
- * ------------------------------------------------------------------------ */
-static HAL_StatusTypeDef ASR_ReadResult(uint16_t addr8, uint8_t *out)
-{
-  return HAL_I2C_Mem_Read(&hi2c1,
-                          addr8,
-                          (uint16_t)ASR_RESULT_REGISTER,
-                          I2C_MEMADD_SIZE_8BIT,
-                          out,
-                          1U,
-                          ASR_I2C_TIMEOUT_MS);
-}
-
-/* --------------------------------------------------------------------------
- * Address probe. Uses the protocol's own access rather than
- * HAL_I2C_IsDeviceReady(): the latter only emits a bare address byte and
- * waits for ADDR, which proves an address ACKs but not that the register
- * read actually works -- and the register read is what we need.
- *
- * Each candidate is preceded by a recovery so a NACK on the first cannot
- * leave the peripheral BUSY for the second.
- * ------------------------------------------------------------------------ */
-static uint16_t ASR_ProbeAddress(void)
-{
-  static const uint16_t candidates[2] = { ASR_ADDR_PRIMARY, ASR_ADDR_ALTERNATE };
-  uint8_t probe = 0U;
-  uint8_t i;
-
-  for (i = 0U; i < 2U; i++)
-  {
-    ASR_BusRecover();
-
-    asr_probe_status[i] = (uint32_t)HAL_I2C_Mem_Read(&hi2c1,
-                                                     candidates[i],
-                                                     (uint16_t)ASR_RESULT_REGISTER,
-                                                     I2C_MEMADD_SIZE_8BIT,
-                                                     &probe,
-                                                     1U,
-                                                     ASR_PROBE_TIMEOUT_MS);
-    asr_probe_error[i] = HAL_I2C_GetError(&hi2c1);
-
-    if (asr_probe_status[i] == (uint32_t)HAL_OK)
-    {
-      asr_addr_probe_result[i] = 0U;
-      asr_i2c_address = candidates[i];
-      return candidates[i];
-    }
-
-    asr_addr_probe_result[i] = 0xFFU;
-  }
-
-  /* Nothing ACKed. Keep polling anyway -- the module may simply be slower
-   * to boot than the MCU, so do not latch this as a permanent verdict. */
-  asr_i2c_address = ASR_ADDR_PRIMARY;
-  return asr_i2c_address;
-}
-
-/* --------------------------------------------------------------------------
- * Sweep the 7-bit address space and print every address that ACKs.
- *
- * This is the tool for the situation the handoff cannot resolve: the module
- * answers at neither 0x34 nor 0x33. Either it is at an address nobody
- * documented, or it is not talking. A scan separates those two cases in one
- * run instead of in an afternoon of guessing.
- *
- * Uses HAL_I2C_IsDeviceReady, which only emits a bare address byte and waits
- * for the ADDR flag. That is all a scan needs -- it proves an address ACKs,
- * without assuming anything about the register protocol behind it.
- *
- * Reserved addresses are skipped: 0x00-0x07 (general call / CBUS / high-speed
- * / EEPROM) and 0x78-0x7F (10-bit addressing and reserved).
- * ------------------------------------------------------------------------ */
-static void ASR_BusScan(void)
-{
-  uint8_t addr7;
-  uint8_t found = 0U;
-
-  printf("Bus scan (7-bit 0x08-0x77)...\r\n");
-
-  for (addr7 = 0x08U; addr7 <= 0x77U; addr7++)
-  {
-    if (HAL_I2C_IsDeviceReady(&hi2c1,
-                              (uint16_t)(addr7 << 1),
-                              2U,          /* 2 trials per address */
-                              20U) == HAL_OK)
-    {
-      printf("  found device at 7-bit 0x%02X (HAL 0x%02X)\r\n",
-             (unsigned)addr7, (unsigned)(addr7 << 1));
-      found = 1U;
-    }
-  }
-
-  if (found == 0U)
-  {
-    printf("  no device ACKed anywhere on the bus.\r\n");
-    printf("  Bus reads high but nothing answers: check module power and\r\n");
-    printf("  that SDA/SCL are wired and not swapped.\r\n");
-  }
-}
-
-/* --------------------------------------------------------------------------
- * Push one raw sample into the ring buffer. Deliberately unconditional:
- * this is the evidence that reveals the module's result hold time.
- * ------------------------------------------------------------------------ */
-static void ASR_TracePush(uint8_t value)
-{
-  asr_raw_trace[asr_raw_trace_head] = value;
-  asr_raw_trace_head++;
-  if (asr_raw_trace_head >= ASR_TRACE_LEN)
-  {
-    asr_raw_trace_head = 0U;
-    asr_raw_trace_full = 1U;
-  }
-}
-
-/* --------------------------------------------------------------------------
- * De-duplication.
- *
- * Whether the module latches its result until read, holds it for a fixed
- * window, or never clears it is not knowable from source, so the rule must
- * be correct under all three: a sample counts as a NEW command if the value
- * changed OR the window elapsed.
- *
- *   - value-change alone would miss a legitimate repeat ("forward" twice)
- *   - window alone would double-count a value that persists past it
- *   - the OR gives one count per distinct command event
- * ------------------------------------------------------------------------ */
-static void ASR_HandleSample(uint8_t value)
-{
-  uint32_t now;
-
-  if (value == 0U)
-  {
-    /* A zero read is the natural end-of-command marker. */
-    return;
-  }
-
-  now = HAL_GetTick();
-
-  if ((value != asr_last_raw_nonzero) ||
-      ((now - asr_last_command_tick) > ASR_DUP_WINDOW_MS))
-  {
-    asr_last_command      = value;
-    asr_last_raw_nonzero  = value;
-    asr_last_command_tick = now;
-    asr_new_command       = 1U;
-    asr_command_count++;
-
-    printf("CMD 0x%02X  #%lu  (t=%lu ms)\r\n",
-           (unsigned)value,
-           (unsigned long)asr_command_count,
-           (unsigned long)now);
-  }
-  else
-  {
-    /* Suppressed as a duplicate. Counted so the window can be tuned. */
-    asr_dup_suppressed++;
-  }
-}
-
-/* --------------------------------------------------------------------------
- * Self-test. Runs with no speech at all, and answers the question that
- * actually matters: is the bus alive, and is the module quiet?
- * ------------------------------------------------------------------------ */
-static void ASR_SelfTest(void)
-{
-  GPIO_InitTypeDef gpio = {0};
-  uint8_t x;
-  uint8_t probe = 0U;
-  uint8_t ok = 0U;
-  uint32_t err_seen = 0U;
-  uint8_t nonzero_seen = 0U;
-  uint8_t invalid_code_seen = 0U;
-
-  asr_selftest_verdict = ASR_VERDICT_PENDING;
-
-  /* ---- Stage 1: is there a real external pull-up? ----------------------
-   * The naive test -- configure the pins as pulled-up inputs and read --
-   * is useless, because the STM32F1's HAL programs a GPIO_PULLUP for INPUT
-   * mode by setting the ODR bit (stm32f1xx_hal_gpio.c, the GPIO_PULLUP
-   * branch). That internal pull-up (~30-50k) holds the line high even on a
-   * bare board with nothing attached, so the test passes when it should
-   * fail. It measures the MCU's own pull-up, not the board's.
-   *
-   * Instead, use the resolution difference between a real pull-up and a
-   * floating pin:
-   *
-   *   1. Drive the line LOW through an open-drain output. This discharges
-   *      the bus capacitance. Open-drain means we can only pull down; the
-   *      high level must come from a pull-up resistor, whoever provides it.
-   *   2. Release it (switch to a plain input, NO internal pull-up) and wait.
-   *      A real external pull-up (~5k) recharges the line in well under
-   *      50 us: tau = 5k * ~200pF = 1 us. With NO external pull-up the pin
-   *      is floating; the only current is leakage, so it stays low.
-   *   3. Re-read with the internal pull-up enabled. This separates
-   *      "no pull-up" (now reads high -- the MCU supplies it) from
-   *      "something is holding the bus down" (still reads low).
-   *
-   * Outcomes:
-   *   step 2 high                        -> external (or module) pull-up present
-   *   step 2 low, step 3 high            -> NO external pull-up: fits one
-   *   step 2 low, step 3 low             -> a device is holding the bus low
-   */
-  asr_selftest_stage = 1U;
-
-  /* DeInit rather than __HAL_I2C_DISABLE(): DeInit sets State to
-   * HAL_I2C_STATE_RESET, and HAL_I2C_Init() only re-runs HAL_I2C_MspInit()
-   * when State is RESET. Using the bare disable left State at READY, so the
-   * later MX_I2C1_Init() skipped MspInit entirely and PB6/PB7 stayed plain
-   * GPIO inputs instead of AF_OD -- the peripheral could not drive the bus
-   * at all. That produced HAL_I2C_WRONG_START (0x200) on every probe. */
-  HAL_I2C_DeInit(&hi2c1);
-
-  /* 1. Discharge: drive both lines low as open-drain outputs. */
-  gpio.Pin   = GPIO_PIN_6 | GPIO_PIN_7;
-  gpio.Mode  = GPIO_MODE_OUTPUT_OD;
-  gpio.Pull  = GPIO_NOPULL;
-  gpio.Speed = GPIO_SPEED_FREQ_HIGH;
-  HAL_GPIO_Init(GPIOB, &gpio);
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6 | GPIO_PIN_7, GPIO_PIN_RESET);
-
-  ASR_ShortDelay(200U);   /* hold low long enough to fully discharge */
-
-  /* 2. Release into a floating input and see whether anything recharges. */
-  gpio.Pin  = GPIO_PIN_6 | GPIO_PIN_7;
-  gpio.Mode = GPIO_MODE_INPUT;
-  gpio.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOB, &gpio);
-
-  ASR_ShortDelay(50U);
-
-  /* Require a majority of samples high, not merely one. A floating line can
-   * pick up noise and read high on a single sample; a real pull-up holds it
-   * high on every sample. Accepting any single high would let noise fake a
-   * pass, which is the failure mode this whole check exists to prevent. */
-  {
-    uint8_t high_count = 0U;
-
-    for (x = 0U; x < 8U; x++)
-    {
-      if ((HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_SET) &&
-          (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_SET))
-      {
-        high_count++;
-      }
-      ASR_ShortDelay(20U);
-    }
-
-    if (high_count >= 6U)   /* 6 of 8 */
-    {
-      asr_selftest_pullup_present = 1U;
-    }
-  }
-
-  /* 3. Now with the internal pull-up: only a genuinely held-low bus stays low. */
-  gpio.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(GPIOB, &gpio);
-
   HAL_Delay(1U);
 
-  for (x = 0U; x < 4U; x++)
-  {
-    if ((HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) != GPIO_PIN_SET) ||
-        (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) != GPIO_PIN_SET))
-    {
-      asr_selftest_bus_low = 1U;
-    }
-    HAL_Delay(1U);
-  }
+  MX_I2C1_Init();                      /* restores AF_OD + 100 kHz */
+  mcp_i2c_speed_hz = MCP_I2C_SPEED_READ;
 
-  MX_I2C1_Init();   /* restore AF_OD */
-
-  /* Report the raw evidence, so the conclusion is never guessed from prose. */
-  printf("Post-test 1: pull-up %s, bus %s\r\n",
-         (asr_selftest_pullup_present != 0U) ? "detected" : "NOT detected",
-         (asr_selftest_bus_low != 0U) ? "held LOW" : "idles high");
-
-  if (asr_selftest_bus_low != 0U)
-  {
-    /* Something is actively holding the line down. Stop here: the answer
-     * and the reason are both already known, and exercising I2C could not
-     * add anything. */
-    asr_selftest_verdict = ASR_VERDICT_BUS_STUCK;
-    asr_selftest_stage = 4U;
-    return;
-  }
-
-  if (asr_selftest_pullup_present == 0U)
-  {
-    /* The bus idles high only thanks to the MCU's internal pull-up, which
-     * is far too weak to run I2C at 100 kHz. Any reads would NACK, which
-     * looks identical to an absent device -- so do not run them and do not
-     * report NO_DEVICE. That confusion is exactly what this check exists
-     * to prevent. */
-    asr_selftest_verdict = ASR_VERDICT_NO_PULLUP;
-    asr_selftest_stage = 4U;
-    return;
-  }
-
-  /* ---- Stage 2: bounded address probe --------------------------------- */
-  asr_selftest_stage = 2U;
-  {
-    static const uint16_t candidates[2] = { ASR_ADDR_PRIMARY, ASR_ADDR_ALTERNATE };
-    uint8_t i;
-
-    for (i = 0U; i < 2U; i++)
-    {
-      for (x = 0U; x < ASR_SELFTEST_ATTEMPTS; x++)
-      {
-        HAL_StatusTypeDef st = HAL_I2C_Mem_Read(&hi2c1, candidates[i],
-                                                (uint16_t)ASR_RESULT_REGISTER,
-                                                I2C_MEMADD_SIZE_8BIT,
-                                                &probe, 1U, ASR_PROBE_TIMEOUT_MS);
-        asr_probe_status[i] = (uint32_t)st;
-
-        if (st == HAL_OK)
-        {
-          asr_addr_probe_result[i] = 0U;
-          asr_i2c_address = candidates[i];
-          /* Do NOT fold the error code in on success -- a stale code left
-           * over from an earlier failure would be misread as evidence about
-           * this probe. */
-          break;
-        }
-
-        /* Only a failed transaction contributes to the error evidence. */
-        asr_probe_error[i] = HAL_I2C_GetError(&hi2c1);
-        err_seen |= asr_probe_error[i];
-
-        asr_addr_probe_result[i] = 0xFFU;
-        HAL_Delay(ASR_SELFTEST_PROBE_GAP);
-      }
-
-      if (asr_addr_probe_result[i] == 0U)
-      {
-        break;
-      }
-    }
-  }
-
-  /* ---- Stage 3: bounded idle read at whatever address answered -------- */
-  asr_selftest_stage = 3U;
-  for (x = 0U; x < ASR_SELFTEST_ATTEMPTS; x++)
-  {
-    asr_selftest_read_attempts++;
-
-    if (ASR_ReadResult(asr_i2c_address, &probe) == HAL_OK)
-    {
-      ok++;
-      asr_selftest_read_ok++;
-
-      if (probe != 0U)
-      {
-        nonzero_seen = 1U;
-        if (probe > 0x09U)
-        {
-          invalid_code_seen = 1U;   /* valid set is 0x00-0x09 */
-        }
-      }
-    }
-    else
-    {
-      err_seen |= HAL_I2C_GetError(&hi2c1);
-    }
-
-    HAL_Delay(ASR_SELFTEST_READ_GAP);
-  }
-
-  asr_selftest_stage = 4U;
-
-  /* ---- Raw evidence, printed before any interpretation ---------------
-   * The previous version of this code collapsed several distinct faults
-   * into one verdict and then described it in prose ("bus clocks, nobody
-   * ACKs") that was not actually verified. Print the measurements first so
-   * the conclusion can be checked rather than trusted.
-   *
-   * Error code reference (Keil's Watch window will not resolve these):
-   *   HAL_I2C_ERROR_AF      = 0x04 -> NACK: bytes clocked out, nobody answered
-   *   HAL_I2C_ERROR_TIMEOUT = 0x20 -> the bus never clocked at all
-   *   HAL_I2C_ERROR_BERR    = 0x01 -> misplaced start/stop
-   *   HAL_I2C_ERROR_ARLO    = 0x02 -> arbitration lost
-   * A code of 0x00 alongside a HAL_ERROR/HAL_BUSY status is its own case:
-   * the HAL returned without setting anything, which is the signature of
-   * the peripheral being latched rather than of a device-level NACK. */
-  /* Status legend matches HAL_StatusTypeDef (stm32f1xx_hal_def.h):
-   *   0 = HAL_OK, 1 = HAL_ERROR, 2 = HAL_BUSY, 3 = HAL_TIMEOUT
-   * Error code legend:
-   *   0x01 BERR, 0x02 ARLO, 0x04 AF (NACK), 0x08 OVR, 0x20 TIMEOUT,
-   *   0x200 WRONG_START (START never generated -- bus not being driven) */
-  printf("Probe 0x68: status=%u (0=OK 1=ERR 2=BUSY 3=TIMEOUT), err=0x%03lX\r\n",
-         (unsigned)asr_probe_status[0], (unsigned long)asr_probe_error[0]);
-  printf("Probe 0x66: status=%u (0=OK 1=ERR 2=BUSY 3=TIMEOUT), err=0x%03lX\r\n",
-         (unsigned)asr_probe_status[1], (unsigned long)asr_probe_error[1]);
-  printf("Self-test: %lu/%lu reads OK, errors seen 0x%02lX\r\n",
-         (unsigned long)asr_selftest_read_ok,
-         (unsigned long)ASR_SELFTEST_ATTEMPTS,
-         (unsigned long)err_seen);
-
-  /* ---- Verdict --------------------------------------------------------
-   * Order matters: the bus-health conclusions must be reachable before the
-   * device-level ones, because a bus fault makes every device-level
-   * observation meaningless. */
-  if ((ok >= ASR_SELFTEST_MIN_OK) && (nonzero_seen == 0U))
-  {
-    asr_selftest_verdict = ASR_VERDICT_PASS;
-  }
-  else if ((asr_addr_probe_result[0] == 0U) || (asr_addr_probe_result[1] == 0U))
-  {
-    /* An address answered, so the bus demonstrably works and the module is
-     * the thing that needs attention. */
-    asr_selftest_verdict = ASR_VERDICT_DEVICE_SILENT;
-  }
-  else if (err_seen == 0U)
-  {
-    /* Nothing ACKed AND the HAL never set an error code. Falling through to
-     * NO_DEVICE here would repeat the original mistake: claiming the bus
-     * clocked when there is no evidence that it did. Report a bus fault. */
-    asr_selftest_verdict = ASR_VERDICT_BUS_STUCK;
-  }
-  else if ((err_seen & HAL_I2C_ERROR_TIMEOUT) != 0U)
-  {
-    /* The bus never clocked at all -- a held line or a clocking fault. */
-    asr_selftest_verdict = ASR_VERDICT_BUS_STUCK;
-  }
-  else
-  {
-    /* NACKs with no timeout: the bus clocked bytes out, so it is
-     * electrically sound, and nothing answered at either address. */
-    asr_selftest_verdict = ASR_VERDICT_NO_DEVICE;
-  }
-
-  /* 0xFF is outside the valid code set, which means the slave was not
-   * driving SDA during the read phase -- a different fault from a NACK. */
-  if ((asr_selftest_verdict == ASR_VERDICT_DEVICE_SILENT) && (invalid_code_seen != 0U))
-  {
-    printf("  note: read values outside the valid set 0x00-0x09; slave is\r\n");
-    printf("        probably not driving SDA (check module power/init).\r\n");
-  }
+  return (released != 0U) ? HAL_OK : HAL_ERROR;
 }
 
-static const char *ASR_VerdictName(uint8_t verdict)
-{
-  switch (verdict)
-  {
-    case ASR_VERDICT_PASS:          return "PASS - bus alive, module quiet";
-    case ASR_VERDICT_NO_DEVICE:     return "NO_DEVICE - bus clocked, nobody ACKed";
-    case ASR_VERDICT_DEVICE_SILENT: return "DEVICE_SILENT - ACKs but no valid code";
-    case ASR_VERDICT_BUS_STUCK:     return "BUS_STUCK - line held low or no clock";
-    case ASR_VERDICT_NO_PULLUP:     return "NO_PULLUP - fit an external pull-up";
-    default:                        return "PENDING";
-  }
-}
-
-#if ASR_USE_HEARTBEAT_LED
 /* --------------------------------------------------------------------------
- * LED0 (red) on PA8 -- NOT PC13, which is touch CS on this board.
- * Non-blocking: driven from HAL_GetTick(), never HAL_Delay, so it cannot
- * spoil the poll schedule.
- *
- *   1 Hz slow  = no device on the bus
- *   double     = device present but every read is 0x00 (bus alive, module silent)
- *   single     = one command just received
- *   solid on   = bus dead / recovery failing
+ * Print a received frame three ways: hex, ASCII, and raw. The raw dump lets
+ * a UTF-8 terminal render the Chinese JSON directly, which makes reading the
+ * tool call easy.
  * ------------------------------------------------------------------------ */
-static void ASR_LedInit(void)
+static void MCP_Dump(const uint8_t *data, uint16_t len)
+{
+  uint16_t i;
+  uint8_t  b;
+
+  printf("HEX: ");
+  for (i = 0U; i < len; i++)
+  {
+    printf("%02X ", (unsigned)data[i]);
+  }
+  printf("\r\n");
+
+  /* Render non-printable bytes as '.' -- a 1-byte payload of 0x01/0x03 is a
+   * control character and would otherwise print as nothing at all, which
+   * looks exactly like "no data received". */
+  printf("RAW: ");
+  for (i = 0U; i < len; i++)
+  {
+    b = data[i];
+    putchar(((b >= 0x20U) && (b <= 0x7EU)) ? (int)b : (int)'.');
+  }
+  printf("\r\n");
+}
+
+/* --------------------------------------------------------------------------
+ * The module broadcasts a single status byte as a 1-byte frame. Naming it
+ * makes the log readable and tells us where the module is in its boot
+ * sequence -- in particular state 5 (listening), which means it is up,
+ * network-connected, and ready to accept speech.
+ * ------------------------------------------------------------------------ */
+static const char *MCP_StateName(uint8_t code)
+{
+  static const char *const names[12] =
+  {
+    "unknown",         /* 0  */
+    "starting",        /* 1  */
+    "configuring",     /* 2  */
+    "idle",            /* 3  */
+    "connecting",      /* 4  */
+    "listening",       /* 5  */
+    "speaking",        /* 6  */
+    "upgrading",       /* 7  */
+    "activating",      /* 8  */
+    "audio_testing",   /* 9  */
+    "fatal_error",     /* 10 */
+    "invalid_state"    /* 11 */
+  };
+
+  return (code < 12U) ? names[code] : "out_of_range";
+}
+
+#if MCP_USE_HEARTBEAT_LED
+/* --------------------------------------------------------------------------
+ * LED0 (red) on PA8, active low, non-blocking.
+ *
+ *   no ACK at 0x55        -> 2 Hz blink
+ *   ACK, no frames yet    -> 1 Hz blink
+ *   frames arriving       -> solid ON
+ * This is a debugger-independent view of mcp_state.
+ * ------------------------------------------------------------------------ */
+static void MCP_LedInit(void)
 {
   GPIO_InitTypeDef gpio = {0};
+
   __HAL_RCC_GPIOA_CLK_ENABLE();
   gpio.Pin   = GPIO_PIN_8;
   gpio.Mode  = GPIO_MODE_OUTPUT_PP;
   gpio.Pull  = GPIO_NOPULL;
   gpio.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &gpio);
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);   /* LED off (active low) */
+
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);   /* off */
 }
 
-static void ASR_LedService(void)
+static void MCP_LedService(void)
 {
-  /* Clean state machine: one static for the next timer deadline, one for
-   * the LED phase (on/off), one for how many blinks remain in the current
-   * group, and one for the group's trailing gap. Non-blocking throughout --
-   * the caller runs this every loop iteration. */
-  static uint32_t next_tick    = 0U;
-  static uint32_t last_seen    = 0U;
-  static uint8_t  led_on       = 0U;
-  static uint8_t  blinks_left  = 0U;
-  static uint8_t  in_gap       = 0U;
+  static uint32_t next_tick = 0U;
+  static uint8_t  on = 0U;
   uint32_t now = HAL_GetTick();
 
   if (now < next_tick)
@@ -1030,83 +921,25 @@ static void ASR_LedService(void)
     return;
   }
 
-  /* A received command briefly overrides the verdict pattern, so there is
-   * instantaneous feedback while speaking. Watch asr_command_count rather
-   * than consuming asr_new_command -- that flag is a consume-once handshake
-   * reserved for the actuator layer, and the LED must not eat it. */
-  if (asr_command_count != last_seen)
+  /* Solid only while frames are genuinely arriving. Keying this off
+   * mcp_state alone made the LED latch on after the very first frame and
+   * stay on forever, which read as "still receiving" when nothing was --
+   * a misleading signal exactly when it mattered most. */
+  if ((mcp_last_frame_tick != 0U) &&
+      ((now - mcp_last_frame_tick) < MCP_ACTIVITY_WINDOW_MS))
   {
-    last_seen = asr_command_count;
-    led_on = 1U;
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);   /* on, active low */
-    next_tick = now + 40U;
-    /* Reset the pattern so it restarts cleanly afterwards. */
-    blinks_left = 0U;
-    in_gap = 1U;
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);   /* solid on */
+    next_tick = now + 100U;
     return;
   }
 
-  /* The verdict drives the light, so LED and UART cannot disagree. The
-   * earlier version lit "bus dead" from a read failure while the UART
-   * claimed the bus was clocking fine.
-   *
-   *   verdict+1 slow blinks, then a 2 s gap, repeating:
-   *     1 blink  = PASS           (bus alive, module quiet)
-   *     2 blinks = NO_DEVICE      (bus clocked, nothing answered)
-   *     3 blinks = DEVICE_SILENT  (answered, but no valid code)
-   *     4 blinks = BUS_STUCK      (line held low / never clocked)
-   *     5 blinks = NO_PULLUP      (fit an external pull-up)
-   */
-  if (in_gap != 0U)
-  {
-    led_on = 0U;
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);      /* off */
-    in_gap = 0U;
-    next_tick = now + 2000U;    /* long gap: makes groups countable */
-    return;
-  }
+  on = (uint8_t)(on ^ 1U);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, on ? GPIO_PIN_RESET : GPIO_PIN_SET);
 
-  if (blinks_left == 0U)
-  {
-    if (asr_selftest_verdict == ASR_VERDICT_PENDING)
-    {
-      /* Self-test still running: stay dark rather than show a stale code. */
-      led_on = 0U;
-      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);
-      next_tick = now + 200U;
-      return;
-    }
-
-    blinks_left = (uint8_t)(asr_selftest_verdict + 1U);
-    if (blinks_left > 5U)
-    {
-      blinks_left = 5U;
-    }
-  }
-
-  if (led_on == 0U)
-  {
-    led_on = 1U;
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);    /* on  */
-    next_tick = now + 120U;
-  }
-  else
-  {
-    led_on = 0U;
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);      /* off */
-    next_tick = now + 180U;
-
-    if (blinks_left > 0U)
-    {
-      blinks_left--;
-    }
-    if (blinks_left == 0U)
-    {
-      in_gap = 1U;   /* group finished; take the long gap next time */
-    }
-  }
+  /* 1 Hz once the module ACKs, 2 Hz before that. */
+  next_tick = now + ((mcp_probe_ok_count > 0U) ? 500U : 250U);
 }
-#endif /* ASR_USE_HEARTBEAT_LED */
+#endif /* MCP_USE_HEARTBEAT_LED */
 
 /* USER CODE END 4 */
 
