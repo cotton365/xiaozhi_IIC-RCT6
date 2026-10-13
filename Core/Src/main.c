@@ -367,13 +367,40 @@ int main(void)
                  (unsigned)mcp_rx_buf[0], MCP_StateName(mcp_rx_buf[0]));
         }
 
-        /* A tool call carries a tool_name field. Acknowledge it, or the
-         * module waits forever: both vendor tools are registered with
-         * "block":"true". */
-        if (strstr((char *)mcp_rx_buf, "tool_name") != NULL)
+        /* Any JSON object is treated as a tool call and acknowledged.
+         *
+         * This deliberately does NOT require a "tool_name" field. Measured
+         * against the real module, the payload arrives as bare parameters:
+         *     {"heading_deg":0,"speed_pct":30,"duration_ms":1000}
+         * -- no tool_name wrapper. The vendor README allows for this
+         * ("Exact wrapper fields may differ by firmware"). Demanding
+         * tool_name meant the call was received, reassembled and checksummed
+         * correctly, yet never acknowledged, so the model blocked forever
+         * waiting: both tools are registered with "block":"true" and the
+         * vendor host states plainly that without this response the model
+         * waits indefinitely.
+         *
+         * Identified by the leading '{' rather than by content, so it stays
+         * correct whichever wrapper this firmware version uses. A 1-byte
+         * status frame never starts with '{', so those are unaffected. */
+        if ((got > 1U) && (mcp_rx_buf[0] == (uint8_t)MCP_JSON_PREFIX))
         {
           mcp_tool_calls++;
-          printf(">>> TOOL CALL -- replying action_finish\r\n");
+
+          /* Name the tool from its parameter set: these are the only two
+           * tools registered, and their argument names are disjoint. */
+          if (strstr((char *)mcp_rx_buf, "heading_deg") != NULL)
+          {
+            printf(">>> TOOL CALL: move_linear -- replying action_finish\r\n");
+          }
+          else if (strstr((char *)mcp_rx_buf, "turn") != NULL)
+          {
+            printf(">>> TOOL CALL: drive_arc -- replying action_finish\r\n");
+          }
+          else
+          {
+            printf(">>> TOOL CALL (unrecognised parameter set) -- replying action_finish\r\n");
+          }
 
           if (MCP_SendBytes((const uint8_t *)"{\"command\":\"action_finish\",\"params\":\"true\"}",
                             (uint16_t)(sizeof("{\"command\":\"action_finish\",\"params\":\"true\"}") - 1U)) == HAL_OK)
