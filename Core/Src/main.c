@@ -80,7 +80,7 @@ typedef enum
 #define MCP_RX_TIMEOUT_MS     20U
 
 #define MCP_POLL_INTERVAL_MS  100U
-#define MCP_REG_RETRY_MS      2000U    /* re-send registration while no JSON yet */
+#define MCP_REG_RETRY_MS      200U     /* re-send registration while no JSON yet */
 #define MCP_STATUS_INTERVAL_MS 5000U   /* periodic counter summary */
 
 /* A frame is treated as "the model answered" iff its payload looks like the
@@ -248,7 +248,12 @@ int main(void)
   /* USER CODE BEGIN 2 */
 
   mcp_i2c_speed_hz = MCP_I2C_SPEED_READ;   /* matches MX_I2C1_Init: 100 kHz */
-  mcp_last_register_tick = HAL_GetTick();
+
+  /* Back-date the registration timer so the retry condition is already
+   * satisfied on the very first poll iteration. The module only accepts
+   * registration during its own startup window, so we must start writing as
+   * early as possible rather than waiting out a full retry period first. */
+  mcp_last_register_tick = HAL_GetTick() - MCP_REG_RETRY_MS;
 
 #if MCP_USE_HEARTBEAT_LED
   MCP_LedInit();
