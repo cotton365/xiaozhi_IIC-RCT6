@@ -22,6 +22,11 @@
 
 /* USER CODE BEGIN 0 */
 
+/* Pin assignments come from board_config.h -- it is the only place they are
+ * written down. See its header comment for why each pin group carries its own
+ * AFIO remap call. */
+#include "board_config.h"
+
 /* USER CODE END 0 */
 
 I2C_HandleTypeDef hi2c1;
@@ -38,7 +43,7 @@ void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.ClockSpeed = MCP_I2C_SPEED_READ;   /* runtime-switched; see mcp_transport.c */
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
@@ -66,15 +71,22 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* i2cHandle)
 
   /* USER CODE END I2C1_MspInit 0 */
 
-    __HAL_RCC_GPIOB_CLK_ENABLE();
-    /**I2C1 GPIO Configuration
-    PB6     ------> I2C1_SCL
-    PB7     ------> I2C1_SDA
-    */
-    GPIO_InitStruct.Pin = GPIO_PIN_6|GPIO_PIN_7;
+    BOARD_I2C_SCL_CLK();
+    BOARD_I2C_SDA_CLK();
+
+    /* Select the pin pair AND its remap bit together. The remap is not optional
+     * polish on top of the pins -- PB8/PB9 are unreachable without it, so the
+     * macro and the pins have to move as one unit. */
+    BOARD_I2C_REMAP_CALL();
+
+    /**I2C1 GPIO Configuration -- see board_config.h for the actual pins.
+     * Both lines are open-drain (correct for I2C); there is no internal pull-up
+     * and none should be added, the bus is pulled up externally. */
+    GPIO_InitStruct.Pin = BOARD_I2C_SCL_PIN | BOARD_I2C_SDA_PIN;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    HAL_GPIO_Init(BOARD_I2C_SCL_PORT, &GPIO_InitStruct);
 
     /* I2C1 clock enable */
     __HAL_RCC_I2C1_CLK_ENABLE();
@@ -95,13 +107,10 @@ void HAL_I2C_MspDeInit(I2C_HandleTypeDef* i2cHandle)
     /* Peripheral clock disable */
     __HAL_RCC_I2C1_CLK_DISABLE();
 
-    /**I2C1 GPIO Configuration
-    PB6     ------> I2C1_SCL
-    PB7     ------> I2C1_SDA
-    */
-    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_6);
+    /**I2C1 GPIO Configuration -- pins from board_config.h. */
+    HAL_GPIO_DeInit(BOARD_I2C_SCL_PORT, BOARD_I2C_SCL_PIN);
 
-    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_7);
+    HAL_GPIO_DeInit(BOARD_I2C_SDA_PORT, BOARD_I2C_SDA_PIN);
 
   /* USER CODE BEGIN I2C1_MspDeInit 1 */
 

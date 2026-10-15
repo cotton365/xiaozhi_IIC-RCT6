@@ -470,6 +470,41 @@
               <FileType>1</FileType>
               <FilePath>../Core/Src/stm32f1xx_hal_msp.c</FilePath>
             </File>
+            <File>
+              <FileName>led.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\led.c</FilePath>
+            </File>
+            <File>
+              <FileName>mcp_diag.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\mcp_diag.c</FilePath>
+            </File>
+            <File>
+              <FileName>mcp_protocol.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\mcp_protocol.c</FilePath>
+            </File>
+            <File>
+              <FileName>mcp_registration.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\mcp_registration.c</FilePath>
+            </File>
+            <File>
+              <FileName>mcp_tools.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\mcp_tools.c</FilePath>
+            </File>
+            <File>
+              <FileName>mcp_transport.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\mcp_transport.c</FilePath>
+            </File>
+            <File>
+              <FileName>retarget_io.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\retarget_io.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

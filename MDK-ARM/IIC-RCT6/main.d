@@ -32,3 +32,11 @@ iic-rct6\main.o: ../Core/Inc/usart.h
 iic-rct6\main.o: ../Core/Inc/gpio.h
 iic-rct6\main.o: E:\KEIL\ARM\ARMCC\Bin\..\include\stdio.h
 iic-rct6\main.o: E:\KEIL\ARM\ARMCC\Bin\..\include\string.h
+iic-rct6\main.o: ../Core/Inc/board_config.h
+iic-rct6\main.o: ../Core/Inc/mcp_diag.h
+iic-rct6\main.o: ../Core/Inc/mcp_transport.h
+iic-rct6\main.o: ../Core/Inc/mcp_protocol.h
+iic-rct6\main.o: ../Core/Inc/mcp_tools.h
+iic-rct6\main.o: ../Core/Inc/mcp_registration.h
+iic-rct6\main.o: ../Core/Inc/retarget_io.h
+iic-rct6\main.o: ../Core/Inc/led.h
