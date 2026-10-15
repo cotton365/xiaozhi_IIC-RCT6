@@ -113,3 +113,19 @@ After the split, re-run `verify_tool_strings.py` and build to the same clean res
 | Python I2C host (cross-check) | `WonderLLM大模型模块（ESP32-S3）\robot-planner-skill\i2c\ch341_wonder_mcp.py` |
 | Vendor board schematic | `WonderLLM大模型模块（ESP32-S3）\3.芯片资料&技术参数\5.原理图\SCH_WonderLLM V1.0.pdf` |
 | String-encoding helpers | `C:\Users\Lenovo\Desktop\wendang\keil\_tools\` |
+
+
+
+
+
+## 9. Additional: Notes on Modularization
+| File | Line | Responsibility |
+|------|------|----------------|
+| board_config.h | 193 | Sole pin configuration point |
+| mcp_transport.[ch] | 169 | I2C bus layer (probe/send-receive/speed change/recovery) |
+| mcp_protocol.[ch] | 209 | Frame parsing |
+| mcp_tools.[ch] | 95 | Tool table |
+| mcp_registration.[ch] | 54 | Registration flow (iterate table and send) |
+| mcp_diag.[ch] | 155 | Counters + logging |
+| led.[ch] | 89 | Heartbeat LED |
+| retarget_io.[ch] | 141 | printf + ring buffer |
